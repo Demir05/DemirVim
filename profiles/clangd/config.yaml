@@ -1,0 +1,20 @@
+# Personal clangd runtime policy.
+#
+# This file intentionally does not choose the clang-tidy check set. The check
+# selection lives in .clang-tidy so clangd and command-line clang-tidy share
+# the same policy, and a repository-local .clang-tidy can replace the personal
+# fallback cleanly.
+
+Diagnostics:
+  ClangTidy:
+    # Keep editor-time analysis responsive. Slow and unprofiled checks belong
+    # in the later explicit project-analysis pass rather than the live editor.
+    FastCheckFilter: Strict
+
+  # Include Cleaner is useful in live editing and is mature enough to keep
+  # enabled explicitly.
+  UnusedIncludes: Strict
+
+  # Missing-include diagnostics are intentionally left disabled for the first
+  # rollout. They are stricter and can be enabled after real-project testing.
+  MissingIncludes: None

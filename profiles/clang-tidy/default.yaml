@@ -1,0 +1,57 @@
+# Personal fallback clang-tidy profile.
+#
+# clang-tidy reads the closest .clang-tidy file in a source file's parent
+# directories. A repository-local .clang-tidy therefore replaces this fallback
+# unless that repository explicitly opts into parent inheritance.
+
+Checks:
+  - "-*"
+
+  # High-signal correctness and lifetime hazards.
+  - "bugprone-*"
+
+  # Low-noise performance mistakes and unnecessary work.
+  - "performance-*"
+
+  # Cross-platform assumptions and non-portable constructs.
+  - "portability-*"
+
+  # Selected C++ Core Guidelines checks with strong semantic value.
+  - "cppcoreguidelines-pro-type-member-init"
+  - "cppcoreguidelines-rvalue-reference-param-not-moved"
+  - "cppcoreguidelines-slicing"
+  - "cppcoreguidelines-special-member-functions"
+  - "cppcoreguidelines-virtual-class-destructor"
+
+  # Selected modernization diagnostics that improve modern C++ expression
+  # without forcing broad style rewrites.
+  - "modernize-use-equals-default"
+  - "modernize-use-equals-delete"
+  - "modernize-use-nodiscard"
+  - "modernize-use-nullptr"
+  - "modernize-use-override"
+  - "modernize-use-using"
+
+  # Selected readability diagnostics that are useful during normal editing.
+  - "readability-const-return-type"
+  - "readability-make-member-function-const"
+  - "readability-redundant-*"
+  - "readability-simplify-boolean-expr"
+
+  # This check is useful in focused reviews but is intentionally excluded from
+  # the live default because it tends to produce excessive API-design noise.
+  - "-bugprone-easily-swappable-parameters"
+
+WarningsAsErrors: ""
+
+# Do not pull in a more distant parent configuration. A project that wants to
+# inherit this file can explicitly opt in from its own .clang-tidy.
+InheritParentConfig: false
+
+# Avoid diagnostics originating from system headers.
+SystemHeaders: false
+
+CheckOptions:
+  # A sole explicitly defaulted destructor is a normal pattern for many base
+  # classes and should not force a full Rule-of-Five declaration set.
+  cppcoreguidelines-special-member-functions.AllowSoleDefaultDtor: "true"

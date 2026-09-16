@@ -1,0 +1,175 @@
+# Deep whole-project C/C++ analysis profile.
+#
+# Compatibility baseline: LLVM/Clang 22.1.x, matching the current Arch/CachyOS
+# toolchain. This profile is intentionally independent from ~/.clang-tidy.
+#
+# Design goals:
+#   - maximize correctness, lifetime, concurrency and security signal;
+#   - keep low-level/compiler/library implementation techniques available;
+#   - avoid platform-specific and policy-only check families that create noise;
+#   - avoid clang-tidy aliases when the canonical check is already enabled;
+#   - keep the configuration deterministic for unattended project-wide scans.
+#
+# The Neovim analysis engine supplies the project-specific --header-filter,
+# compilation database and --config-file arguments.
+
+Checks:
+  # Start from an explicit empty set.
+  - "-*"
+
+  # Preserve Clang warnings already enabled by compile_commands.json.
+  # This does not enable additional -W flags; it only prevents clang-tidy from
+  # filtering diagnostics produced by the project's real compile command.
+  - "clang-diagnostic-*"
+
+  # Clang Static Analyzer.
+  #
+  # Use the general C/C++ and Linux-relevant families explicitly instead of
+  # clang-analyzer-*. The global wildcard also selects platform-specific
+  # Fuchsia, macOS/Cocoa, WebKit and MPI analyzer families that are unrelated
+  # to a normal Linux C/C++ project.
+  - "clang-analyzer-core.*"
+  - "clang-analyzer-cplusplus.*"
+  - "clang-analyzer-deadcode.*"
+  - "clang-analyzer-nullability.*"
+  - "clang-analyzer-security.*"
+  - "clang-analyzer-unix.*"
+  - "clang-analyzer-optin.core.*"
+  - "clang-analyzer-optin.cplusplus.*"
+  - "clang-analyzer-optin.portability.*"
+  - "clang-analyzer-optin.taint.*"
+
+  # Broad bug-focused diagnostics.
+  - "bugprone-*"
+
+  # Valuable in targeted API reviews, but too noisy as a whole-project default.
+  - "-bugprone-easily-swappable-parameters"
+
+  # Threading, cancellation and coroutine-adjacent concurrency hazards.
+  - "concurrency-*"
+
+  # Performance diagnostics are useful in an explicit deep scan, including
+  # provenance-sensitive integer-to-pointer conversions.
+  - "performance-*"
+
+  # Keep portability diagnostics that expose real language/library assumptions,
+  # but do not complain about two techniques that are commonly intentional in
+  # low-level and compiler code.
+  - "portability-*"
+  - "-portability-avoid-pragma-once"
+  - "-portability-simd-intrinsics"
+
+  # C++ Core Guidelines checks selected for semantic value rather than style.
+  - "cppcoreguidelines-avoid-capturing-lambda-coroutines"
+  - "cppcoreguidelines-avoid-reference-coroutine-parameters"
+  - "cppcoreguidelines-init-variables"
+  - "cppcoreguidelines-interfaces-global-init"
+  - "cppcoreguidelines-misleading-capture-default-by-value"
+  - "cppcoreguidelines-missing-std-forward"
+  - "cppcoreguidelines-no-suspend-with-lock"
+  - "cppcoreguidelines-pro-type-member-init"
+  - "cppcoreguidelines-slicing"
+  - "cppcoreguidelines-special-member-functions"
+  - "cppcoreguidelines-virtual-class-destructor"
+
+  # Semantic and structural checks with strong signal in libraries and large
+  # C++ codebases.
+  - "misc-anonymous-namespace-in-header"
+  - "misc-confusable-identifiers"
+  - "misc-coroutine-hostile-raii"
+  - "misc-definitions-in-headers"
+  - "misc-header-include-cycle"
+  - "misc-misleading-bidirectional"
+  - "misc-misleading-identifier"
+  - "misc-misplaced-const"
+  - "misc-new-delete-overloads"
+  - "misc-non-copyable-objects"
+  - "misc-override-with-different-visibility"
+  - "misc-predictable-rand"
+  - "misc-redundant-expression"
+  - "misc-static-assert"
+  - "misc-throw-by-value-catch-by-reference"
+  - "misc-unconventional-assign-operator"
+  - "misc-uniqueptr-reset-release"
+  - "misc-unused-using-decls"
+
+  # Modern-C++ transformations with low semantic ambiguity.
+  - "modernize-use-equals-default"
+  - "modernize-use-equals-delete"
+  - "modernize-use-nodiscard"
+  - "modernize-use-nullptr"
+  - "modernize-use-override"
+  - "modernize-use-using"
+
+  # Readability checks retained only where they commonly reveal mistakes,
+  # lifetime hazards, stale declarations or misleading expressions.
+  - "readability-ambiguous-smartptr-reset-call"
+  - "readability-const-return-type"
+  - "readability-container-size-empty"
+  - "readability-duplicate-include"
+  - "readability-inconsistent-declaration-parameter-name"
+  - "readability-make-member-function-const"
+  - "readability-math-missing-parentheses"
+  - "readability-misleading-indentation"
+  - "readability-misplaced-array-index"
+  - "readability-redundant-*"
+  - "readability-reference-to-constructed-temporary"
+  - "readability-simplify-boolean-expr"
+  - "readability-string-compare"
+  - "readability-suspicious-call-argument"
+  - "readability-uniqueptr-delete-release"
+
+# Deep analysis reports findings but does not change their severity policy.
+WarningsAsErrors: ""
+
+# The explicit deep profile must not inherit a repository/user fallback profile.
+InheritParentConfig: false
+
+# Project code is the target. System-header implementation details are excluded.
+SystemHeaders: false
+
+# Keep subprocess output deterministic even outside the Neovim wrapper.
+UseColor: false
+
+# The deep scanner never applies fixes automatically; formatting is therefore
+# disabled as an additional safety/default-determinism measure.
+FormatStyle: "none"
+
+# File classification matters to checks such as misc-definitions-in-headers.
+# Include an empty suffix for extensionless headers and common library/template
+# header suffixes. C++ module interface/source suffixes are implementation units.
+HeaderFileExtensions:
+  - ""
+  - "h"
+  - "hh"
+  - "hpp"
+  - "hxx"
+  - "h++"
+  - "inc"
+  - "inl"
+  - "ipp"
+  - "tpp"
+
+ImplementationFileExtensions:
+  - "c"
+  - "C"
+  - "cc"
+  - "cpp"
+  - "cxx"
+  - "c++"
+  - "m"
+  - "mm"
+  - "ixx"
+  - "cppm"
+  - "ccm"
+  - "cxxm"
+  - "mxx"
+
+CheckOptions:
+  # In systems/library code an explicit cast to void is a deliberate and
+  # reviewable acknowledgement that a return value is intentionally ignored.
+  bugprone-unused-return-value.AllowCastToVoid: "true"
+
+  # A sole explicitly defaulted destructor is a normal pattern for polymorphic
+  # base classes and should not force a synthetic Rule-of-Five declaration set.
+  cppcoreguidelines-special-member-functions.AllowSoleDefaultDtor: "true"
