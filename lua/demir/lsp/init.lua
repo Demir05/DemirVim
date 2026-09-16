@@ -1,11 +1,25 @@
 local capabilities = require("blink.cmp").get_lsp_capabilities()
 
 -- ─────────────────────────────────────────────────────────────
--- Ortak LSP Ayarları
+-- LSP Client Capabilities
 -- ─────────────────────────────────────────────────────────────
 
+capabilities.textDocument = capabilities.textDocument or {}
+
+-- Keep the hierarchy capabilities explicit. They are consumed by the custom
+-- Call Hierarchy and Type Hierarchy UIs and are harmless if the completion
+-- capability provider already advertised them.
+capabilities.textDocument.callHierarchy = capabilities.textDocument.callHierarchy or {
+	dynamicRegistration = false,
+}
+
+capabilities.textDocument.typeHierarchy = capabilities.textDocument.typeHierarchy or {
+	dynamicRegistration = false,
+}
+
+-- Shared defaults are merged into every enabled LSP configuration by Neovim.
 vim.lsp.config("*", {
-    capabilities = capabilities,
+	capabilities = capabilities,
 })
 
 -- ─────────────────────────────────────────────────────────────
@@ -13,32 +27,28 @@ vim.lsp.config("*", {
 -- ─────────────────────────────────────────────────────────────
 
 vim.lsp.config("lua_ls", {
-    settings = {
-        Lua = {
-            runtime = {
-                version = "LuaJIT",
-            },
+	settings = {
+		Lua = {
+			runtime = {
+				version = "LuaJIT",
+			},
 
-            diagnostics = {
-                globals = {
-                    "vim",
-                },
-            },
+			diagnostics = {
+				globals = {
+					"vim",
+				},
+			},
 
-            workspace = {
-                checkThirdParty = false,
+			workspace = {
+				checkThirdParty = false,
+				library = vim.api.nvim_get_runtime_file("", true),
+			},
 
-                library = vim.api.nvim_get_runtime_file(
-                    "",
-                    true
-                ),
-            },
-
-            telemetry = {
-                enable = false,
-            },
-        },
-    },
+			telemetry = {
+				enable = false,
+			},
+		},
+	},
 })
 
 -- ─────────────────────────────────────────────────────────────
@@ -46,13 +56,21 @@ vim.lsp.config("lua_ls", {
 -- ─────────────────────────────────────────────────────────────
 
 local servers = {
-    "clangd",    -- C / C++
-    "lua_ls",    -- Lua
-    "jsonls",    -- JSON / JSONC
-    "yamlls",    -- YAML
-    "marksman",  -- Markdown
-    "bashls",    -- Bash / shell
-    "cmake",     -- CMake
+	"clangd", -- C / C++
+	"lua_ls", -- Lua
+	"jsonls", -- JSON / JSONC
+	"yamlls", -- YAML
+	"marksman", -- Markdown
+	"bashls", -- Bash / shell
+	"cmake", -- CMake
 }
 
 vim.lsp.enable(servers)
+
+-- ─────────────────────────────────────────────────────────────
+-- Semantic Tools
+-- ─────────────────────────────────────────────────────────────
+
+require("demir.lsp.call_hierarchy")
+require("demir.lsp.type_hierarchy")
+require("demir.lsp.clangd")

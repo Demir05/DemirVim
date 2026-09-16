@@ -1,150 +1,199 @@
+local M = {}
+
 local conform = require("conform")
 
 -- ─────────────────────────────────────────────────────────────
--- Formatter Yapılandırması
+-- Formatting Policy
 -- ─────────────────────────────────────────────────────────────
 
+local FORMAT_TIMEOUT_MS = 3000
+
+local function valid_buffer(bufnr)
+	return type(bufnr) == "number" and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr)
+end
+
+local function normal_buffer(bufnr)
+	return valid_buffer(bufnr) and vim.bo[bufnr].buftype == ""
+end
+
+local function notify(message, level)
+	vim.notify(message, level or vim.log.levels.INFO, {
+		title = "Formatting",
+	})
+end
+
 conform.setup({
-    formatters_by_ft = {
-        -- C / C++
-        c = {
-            "clang_format",
-        },
+	formatters_by_ft = {
+		-- C / C++
+		c = {
+			"clang_format",
+		},
 
-        cpp = {
-            "clang_format",
-        },
+		cpp = {
+			"clang_format",
+		},
 
-        objc = {
-            "clang_format",
-        },
+		objc = {
+			"clang_format",
+		},
 
-        objcpp = {
-            "clang_format",
-        },
+		objcpp = {
+			"clang_format",
+		},
 
-        -- Lua
-        lua = {
-            "stylua",
-        },
+		-- Lua
+		lua = {
+			"stylua",
+		},
 
-        -- CMake
-        cmake = {
-            "gersemi",
-        },
+		-- CMake
+		cmake = {
+			"gersemi",
+		},
 
-        -- Shell
-        sh = {
-            "shfmt",
-        },
+		-- Shell
+		sh = {
+			"shfmt",
+		},
 
-        bash = {
-            "shfmt",
-        },
+		bash = {
+			"shfmt",
+		},
 
-        -- JSON
-        json = {
-            "prettier",
-        },
+		-- JSON
+		json = {
+			"prettier",
+		},
 
-        jsonc = {
-            "prettier",
-        },
+		jsonc = {
+			"prettier",
+		},
 
-        -- YAML
-        yaml = {
-            "prettier",
-        },
+		-- YAML
+		yaml = {
+			"prettier",
+		},
 
-        -- Markdown
-        markdown = {
-            "prettier",
-        },
+		-- Markdown
+		markdown = {
+			"prettier",
+		},
 
-        -- JavaScript / TypeScript
-        javascript = {
-            "prettier",
-        },
+		-- JavaScript / TypeScript
+		javascript = {
+			"prettier",
+		},
 
-        javascriptreact = {
-            "prettier",
-        },
+		javascriptreact = {
+			"prettier",
+		},
 
-        typescript = {
-            "prettier",
-        },
+		typescript = {
+			"prettier",
+		},
 
-        typescriptreact = {
-            "prettier",
-        },
+		typescriptreact = {
+			"prettier",
+		},
 
-        -- Web
-        html = {
-            "prettier",
-        },
+		-- Web
+		html = {
+			"prettier",
+		},
 
-        css = {
-            "prettier",
-        },
+		css = {
+			"prettier",
+		},
 
-        scss = {
-            "prettier",
-        },
+		scss = {
+			"prettier",
+		},
 
-        less = {
-            "prettier",
-        },
-    },
+		less = {
+			"prettier",
+		},
+	},
 
-    -- Formatter hata verirse bildirim göster.
-    notify_on_error = true,
+	-- Keep one formatting policy everywhere:
+	-- prefer a configured Conform formatter and fall back to LSP formatting
+	-- only when no external formatter is available for the buffer.
+	default_format_opts = {
+		lsp_format = "fallback",
+	},
 
-    -- Kaydederken otomatik format.
-    format_on_save = function(bufnr)
-        local filetype =
-            vim.bo[bufnr].filetype
+	notify_on_error = true,
+	notify_no_formatters = true,
 
-        -- Markdown otomatik formatlanmasın.
-        -- Space+m ile manuel olarak formatlanabilir.
-        if filetype == "markdown" then
-            return nil
-        end
+	-- Format on save for normal source files. Markdown remains manual-only.
+	format_on_save = function(bufnr)
+		if not normal_buffer(bufnr) then
+			return nil
+		end
 
-        return {
-            timeout_ms = 3000,
+		if vim.bo[bufnr].filetype == "markdown" then
+			return nil
+		end
 
-            -- Conform formatter'ı varsa onu kullan.
-            -- Yoksa LSP formatter'a düş.
-            lsp_format = "fallback",
-        }
-    end,
+		return {
+			timeout_ms = FORMAT_TIMEOUT_MS,
+		}
+	end,
 })
 
 -- ─────────────────────────────────────────────────────────────
--- Manuel Format
+-- Public API
 -- ─────────────────────────────────────────────────────────────
 
-local function format_buffer()
-    conform.format({
-        async = true,
+function M.can_format(bufnr)
+	bufnr = bufnr or vim.api.nvim_get_current_buf()
 
-        -- Conform formatter'ı varsa onu kullan.
-        -- Yoksa LSP formatter'a düş.
-        lsp_format = "fallback",
+	if not normal_buffer(bufnr) then
+		return false
+	end
 
-        timeout_ms = 3000,
-    })
+	local ok, formatters, will_use_lsp = pcall(conform.list_formatters_to_run, bufnr)
+
+	if not ok then
+		return false
+	end
+
+	return (type(formatters) == "table" and #formatters > 0) or will_use_lsp == true
+end
+
+function M.format_buffer(bufnr)
+	bufnr = bufnr or vim.api.nvim_get_current_buf()
+
+	if not normal_buffer(bufnr) then
+		notify("The current buffer is not a normal file buffer.", vim.log.levels.WARN)
+		return false
+	end
+
+	if not M.can_format(bufnr) then
+		notify("No formatter is available for the current buffer.", vim.log.levels.WARN)
+		return false
+	end
+
+	local ok, attempted = pcall(conform.format, {
+		bufnr = bufnr,
+		async = true,
+	})
+
+	if not ok then
+		notify("Formatting could not be started: " .. tostring(attempted), vim.log.levels.ERROR)
+		return false
+	end
+
+	return attempted == true
 end
 
 -- ─────────────────────────────────────────────────────────────
--- Kısayollar
+-- Keymap
 -- ─────────────────────────────────────────────────────────────
 
-vim.keymap.set(
-    "n",
-    "<leader>m",
-    format_buffer,
-    {
-        desc = "Dosyayı biçimlendir",
-    }
-)
+vim.keymap.set("n", "<leader>m", function()
+	M.format_buffer(vim.api.nvim_get_current_buf())
+end, {
+	desc = "Format file",
+})
+
+return M

@@ -1,158 +1,136 @@
+local M = {}
+
 local diagnostic = vim.diagnostic
-local Snacks = require("snacks")
+local severity = diagnostic.severity
 
 -- ─────────────────────────────────────────────────────────────
--- Simgeler
+-- Diagnostic Appearance
 -- ─────────────────────────────────────────────────────────────
 
 local icons = {
-    [diagnostic.severity.ERROR] = "",
-    [diagnostic.severity.WARN] = "",
-    [diagnostic.severity.INFO] = "",
-    [diagnostic.severity.HINT] = "",
+	[severity.ERROR] = "",
+	[severity.WARN] = "",
+	[severity.INFO] = "",
+	[severity.HINT] = "",
 }
 
-local highlights = {
-    [diagnostic.severity.ERROR] = "DiagnosticSignError",
-    [diagnostic.severity.WARN] = "DiagnosticSignWarn",
-    [diagnostic.severity.INFO] = "DiagnosticSignInfo",
-    [diagnostic.severity.HINT] = "DiagnosticSignHint",
+local sign_highlights = {
+	[severity.ERROR] = "DiagnosticSignError",
+	[severity.WARN] = "DiagnosticSignWarn",
+	[severity.INFO] = "DiagnosticSignInfo",
+	[severity.HINT] = "DiagnosticSignHint",
 }
 
--- ─────────────────────────────────────────────────────────────
--- Kısa satır içi mesaj
--- ─────────────────────────────────────────────────────────────
+local function truncate_display(text, max_width)
+	if vim.fn.strdisplaywidth(text) <= max_width then
+		return text
+	end
+
+	local ellipsis = "…"
+	local target_width = math.max(0, max_width - vim.fn.strdisplaywidth(ellipsis))
+	local low = 0
+	local high = vim.fn.strchars(text)
+
+	while low < high do
+		local mid = math.floor((low + high + 1) / 2)
+		local part = vim.fn.strcharpart(text, 0, mid)
+
+		if vim.fn.strdisplaywidth(part) <= target_width then
+			low = mid
+		else
+			high = mid - 1
+		end
+	end
+
+	return vim.fn.strcharpart(text, 0, low) .. ellipsis
+end
 
 local function compact_message(item)
-    local message = item.message
-        :gsub("\n", " ")
-        :gsub("%s+", " ")
+	local message = tostring(item.message or ""):gsub("\r", " "):gsub("\n", " "):gsub("%s+", " ")
 
-    -- Satırın sağ tarafını dev bir hata mesajıyla doldurma.
-    if vim.fn.strdisplaywidth(message) > 100 then
-        message = vim.fn.strcharpart(message, 0, 97) .. "…"
-    end
-
-    return message
+	return truncate_display(message, 100)
 end
 
 -- ─────────────────────────────────────────────────────────────
--- Diagnostic yapılandırması
+-- Global Diagnostic Policy
 -- ─────────────────────────────────────────────────────────────
 
 diagnostic.config({
-    -- ERROR > WARN > INFO > HINT sıralaması.
-    severity_sort = true,
+	-- ERROR > WARN > INFO > HINT.
+	severity_sort = true,
 
-    -- Insert modunda da clangd/lua_ls vb. sonuçlarını güncelle.
-    update_in_insert = true,
+	-- Preserve the existing live-feedback behavior while typing.
+	update_in_insert = true,
 
-    -- ---------------------------------------------------------
-    -- Sol işaret sütunu
-    -- ---------------------------------------------------------
+	-- Sign column.
+	signs = {
+		priority = 20,
+		text = icons,
+	},
 
-    signs = {
-        priority = 20,
+	-- Keep the editor visually quiet: underline only errors and warnings.
+	underline = {
+		severity = {
+			min = severity.WARN,
+		},
+	},
 
-        text = icons,
-    },
+	-- Show short inline text only for the current line and only for
+	-- errors/warnings. Other lines retain signs and underlines.
+	virtual_text = {
+		current_line = true,
 
-    -- ---------------------------------------------------------
-    -- Alt çizgiler
-    --
-    -- INFO/HINT için kodu sürekli çizerek görüntüyü kirletmiyoruz.
-    -- Yalnızca hata ve uyarılar altı çizili.
-    -- ---------------------------------------------------------
+		severity = {
+			min = severity.WARN,
+		},
 
-    underline = {
-        severity = {
-            min = diagnostic.severity.WARN,
-        },
-    },
+		spacing = 2,
+		source = false,
 
-    -- ---------------------------------------------------------
-    -- Satır içi diagnostic
-    --
-    -- Yalnızca imlecin bulunduğu satırdaki ERROR/WARN mesajını
-    -- gösterir. Diğer satırlarda yalnızca simge ve underline kalır.
-    -- ---------------------------------------------------------
+		prefix = function(item)
+			return icons[item.severity] or "●"
+		end,
 
-    virtual_text = {
-        current_line = true,
+		format = compact_message,
+	},
 
-        severity = {
-            min = diagnostic.severity.WARN,
-        },
+	virtual_lines = false,
 
-        spacing = 2,
+	-- Diagnostic popup.
+	float = {
+		border = "rounded",
+		scope = "line",
+		severity_sort = true,
+		source = "if_many",
 
-        source = false,
+		header = {
+			" 󰒡 Diagnostics ",
+			"DiagnosticInfo",
+		},
 
-        prefix = function(item)
-            return icons[item.severity] or "●"
-        end,
+		prefix = function(item)
+			return (icons[item.severity] or "●") .. " ", sign_highlights[item.severity] or "DiagnosticSignInfo"
+		end,
 
-        format = compact_message,
-    },
+		suffix = function(item)
+			if item.code ~= nil and tostring(item.code) ~= "" then
+				return "  [" .. tostring(item.code) .. "]", "Comment"
+			end
 
-    -- Aynı bilgiyi ayrıca alt satırlara basıp ekranı büyütme.
-    virtual_lines = false,
+			return ""
+		end,
 
-    -- ---------------------------------------------------------
-    -- Diagnostic popup
-    -- ---------------------------------------------------------
+		max_width = 100,
+		max_height = 25,
+	},
 
-    float = {
-        border = "rounded",
-
-        scope = "line",
-
-        severity_sort = true,
-
-        source = "if_many",
-
-        header = {
-            " 󰒡 Tanılama ",
-            "DiagnosticInfo",
-        },
-
-        prefix = function(item)
-            return (icons[item.severity] or "●") .. " ",
-                highlights[item.severity]
-        end,
-
-        suffix = function(item)
-            if item.code then
-                return "  [" .. tostring(item.code) .. "]",
-                    "Comment"
-            end
-
-            return ""
-        end,
-
-        max_width = 100,
-        max_height = 25,
-    },
-
-    -- Dosyanın sonundan sonraki diagnostic'e basıldığında
-    -- tekrar dosyanın başına ışınlanma.
-    jump = {
-        wrap = false,
-    },
+	-- Do not wrap from the final diagnostic back to the first one.
+	jump = {
+		wrap = false,
+	},
 })
 
--- ─────────────────────────────────────────────────────────────
--- Proje problemleri
--- ─────────────────────────────────────────────────────────────
---
--- Space+p
---
--- Açık çalışma dizinindeki bütün diagnostics'i aranabilir,
--- önizlemeli Snacks picker içinde gösterir.
--- ─────────────────────────────────────────────────────────────
+M.icons = icons
+M.sign_highlights = sign_highlights
 
-vim.keymap.set("n", "<leader>p", function()
-    Snacks.picker.diagnostics()
-end, {
-    desc = "Proje problemleri",
-})
+return M

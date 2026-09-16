@@ -32,6 +32,16 @@ wk.add({
 	},
 
 	{
+		"<leader>pb",
+		desc = "Buffer problems",
+	},
+
+	{
+		"<leader>pe",
+		desc = "Errors only",
+	},
+
+	{
 		"<leader>b",
 		desc = "Derleme merkezi",
 	},
@@ -49,5 +59,24 @@ wk.add({
 	{
 		"<leader>i",
 		desc = "AI sohbeti",
+	},
+
+	{
+		"<leader>s",
+		desc = "Symbol Center",
+	},
+
+	-- ─────────────────────────────────────────────────────────────
+	-- LSP / Semantic Tools
+	-- ─────────────────────────────────────────────────────────────
+
+	{
+		"<leader>l",
+		group = "LSP / Semantic",
+	},
+
+	{
+		"<leader>lh",
+		desc = "Çağrı hiyerarşisi",
 	},
 })

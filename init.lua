@@ -35,6 +35,8 @@ require("demir.editor.treesitter")
 require("demir.editor.completion")
 require("demir.editor.formatting")
 require("demir.editor.markdown")
+require("demir.editor.problems")
+require("demir.editor.symbols")
 
 -- ─────────────────────────────────────────────────────────────
 -- LSP
