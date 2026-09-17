@@ -1,5 +1,8 @@
 local M = {}
 
+local workspace = require("demir.lsp.workspace")
+local common = require("demir.lsp.hierarchy_common")
+
 local ns = vim.api.nvim_create_namespace("DemirCallHierarchy")
 
 local PREPARE_METHOD = "textDocument/prepareCallHierarchy"
@@ -13,52 +16,15 @@ local pack_args = table.pack or function(...)
 end
 
 -- ─────────────────────────────────────────────────────────────
--- Symbol Metadata
+-- Shared Hierarchy Primitives
 -- ─────────────────────────────────────────────────────────────
 --
--- Yalnızca Neovim'in standart highlight gruplarını kullanıyoruz.
--- Böylece Gruber Darker veya başka bir colorscheme ile çalışırken
--- özel Tree-sitter capture adlarına bağımlı kalmıyoruz.
+-- Stateless mechanics shared by Call Hierarchy and Type Hierarchy live in
+-- demir.lsp.hierarchy_common. Protocol semantics and per-session state remain
+-- local to this module.
 -- ─────────────────────────────────────────────────────────────
 
-local symbol_kinds = {
-	[1] = { name = "File", icon = "󰈙", hl = "Directory" },
-	[2] = { name = "Module", icon = "󰏗", hl = "Identifier" },
-	[3] = { name = "Namespace", icon = "󰅩", hl = "Identifier" },
-	[4] = { name = "Package", icon = "󰏖", hl = "Directory" },
-	[5] = { name = "Class", icon = "󰠱", hl = "Type" },
-	[6] = { name = "Method", icon = "󰆧", hl = "Function" },
-	[7] = { name = "Property", icon = "󰜢", hl = "Identifier" },
-	[8] = { name = "Field", icon = "󰜢", hl = "Identifier" },
-	[9] = { name = "Constructor", icon = "󰆧", hl = "Function" },
-	[10] = { name = "Enum", icon = "󰦨", hl = "Type" },
-	[11] = { name = "Interface", icon = "󰜰", hl = "Type" },
-	[12] = { name = "Function", icon = "󰊕", hl = "Function" },
-	[13] = { name = "Variable", icon = "󰀫", hl = "Identifier" },
-	[14] = { name = "Constant", icon = "󰏿", hl = "Constant" },
-	[15] = { name = "String", icon = "󰉾", hl = "String" },
-	[16] = { name = "Number", icon = "󰎠", hl = "Number" },
-	[17] = { name = "Boolean", icon = "󰨙", hl = "Boolean" },
-	[18] = { name = "Array", icon = "󰅪", hl = "Identifier" },
-	[19] = { name = "Object", icon = "󰅩", hl = "Type" },
-	[20] = { name = "Key", icon = "󰌆", hl = "Identifier" },
-	[21] = { name = "Null", icon = "󰟢", hl = "Constant" },
-	[22] = { name = "Enum Member", icon = "󰦨", hl = "Constant" },
-	[23] = { name = "Struct", icon = "󰙅", hl = "Type" },
-	[24] = { name = "Event", icon = "󱐋", hl = "Special" },
-	[25] = { name = "Operator", icon = "󰆕", hl = "Operator" },
-	[26] = { name = "Type Parameter", icon = "󰗴", hl = "Type" },
-}
-
-local fallback_kind = {
-	name = "Symbol",
-	icon = "󰘦",
-	hl = "Identifier",
-}
-
-local function kind_info(kind)
-	return symbol_kinds[kind] or fallback_kind
-end
+local kind_info = common.kind_info
 
 -- ─────────────────────────────────────────────────────────────
 -- Runtime State
@@ -86,6 +52,7 @@ local state = {
 	project_root = nil,
 	root_item = nil,
 	roots = {},
+	relevant_buffers = {},
 
 	trees = {
 		incoming = nil,
@@ -112,53 +79,13 @@ local state = {
 -- Basic Helpers
 -- ─────────────────────────────────────────────────────────────
 
-local function valid_buf(buf)
-	return buf ~= nil and vim.api.nvim_buf_is_valid(buf)
-end
-
-local function loaded_buf(buf)
-	return valid_buf(buf) and vim.api.nvim_buf_is_loaded(buf)
-end
-
-local function valid_win(win)
-	return win ~= nil and vim.api.nvim_win_is_valid(win)
-end
-
-local function normalize_path(path)
-	if not path or path == "" then
-		return ""
-	end
-
-	return vim.fs.normalize(path)
-end
-
-local function one_line(value)
-	if value == nil or value == vim.NIL then
-		return ""
-	end
-
-	local ok, text = pcall(tostring, value)
-
-	if not ok then
-		return ""
-	end
-
-	return text:gsub("%c", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function uri_to_file(uri)
-	if type(uri) ~= "string" or not uri:match("^file:") then
-		return nil
-	end
-
-	local ok, file = pcall(vim.uri_to_fname, uri)
-
-	if not ok or not file or file == "" then
-		return nil
-	end
-
-	return normalize_path(file)
-end
+local valid_buf = common.valid_buf
+local loaded_buf = common.loaded_buf
+local valid_win = common.valid_win
+local normalize_path = common.normalize_path
+local one_line = common.one_line
+local uri_to_file = common.uri_to_file
+local safe_table = common.safe_table
 
 local function report_internal_error(context, err)
 	vim.schedule(function()
@@ -176,141 +103,28 @@ local function notify(message, level)
 	})
 end
 
-local function safe_table(value)
-	return type(value) == "table" and value or {}
-end
-
-local function path_in_root(root, file)
-	root = normalize_path(root)
-	file = normalize_path(file)
-
-	if root == "" or file == "" then
-		return false
+local function mark_relevant_buffer(buf)
+	if loaded_buf(buf) then
+		state.relevant_buffers[buf] = true
 	end
-
-	if root == file then
-		return true
-	end
-
-	return vim.fs.relpath(root, file) ~= nil
-end
-
-local function collect_client_roots(client, source_file)
-	local roots = {}
-	local seen = {}
-
-	local function add_root(root)
-		root = normalize_path(root)
-
-		if root == "" or seen[root] then
-			return
-		end
-
-		seen[root] = true
-		table.insert(roots, root)
-	end
-
-	for _, folder in ipairs(safe_table(client and client.workspace_folders)) do
-		if type(folder) == "table" and folder.uri then
-			local root = uri_to_file(folder.uri)
-
-			if root then
-				add_root(root)
-			end
-		end
-	end
-
-	if client and client.root_dir then
-		add_root(client.root_dir)
-	end
-
-	if #roots == 0 then
-		local fallback = vim.fs.root(source_file, {
-			{ "CMakePresets.json", "CMakeLists.txt", ".git" },
-		})
-
-		add_root(fallback or vim.fn.getcwd())
-	end
-
-	table.sort(roots, function(a, b)
-		return #a > #b
-	end)
-
-	local primary = nil
-
-	for _, root in ipairs(roots) do
-		if path_in_root(root, source_file) then
-			primary = root
-			break
-		end
-	end
-
-	return primary or roots[1], roots
-end
-
-local function relative_file_from_uri(uri)
-	local file = uri_to_file(uri)
-
-	if not file then
-		return one_line(uri or "<non-file URI>")
-	end
-
-	for _, root in ipairs(state.roots or {}) do
-		local relative = vim.fs.relpath(root, file)
-
-		if relative then
-			if relative == "." then
-				return one_line(vim.fs.basename(file))
-			end
-
-			return one_line(relative)
-		end
-	end
-
-	return one_line(vim.fs.basename(file))
 end
 
 local function item_location_text(item)
-	if type(item) ~= "table" then
-		return ""
-	end
-
-	local range = item.selectionRange or item.range
-	local line = type(range) == "table" and type(range.start) == "table" and range.start.line or nil
-	local file = relative_file_from_uri(item.uri)
-
-	if line == nil then
-		return file
-	end
-
-	return string.format("%s:%d", file, line + 1)
+	return common.item_location_text(state.roots, item)
 end
 
 -- ─────────────────────────────────────────────────────────────
 -- Scratch Buffers
 -- ─────────────────────────────────────────────────────────────
 
-local function create_buffer(name)
-	local buf = vim.api.nvim_create_buf(false, true)
-
-	vim.api.nvim_buf_set_name(buf, name)
-
-	vim.bo[buf].buftype = "nofile"
-	vim.bo[buf].bufhidden = "wipe"
-	vim.bo[buf].swapfile = false
-	vim.bo[buf].modifiable = false
-
-	return buf
-end
+local create_buffer = common.create_buffer
 
 local function set_lines(buf, lines)
-	if not valid_buf(buf) then
-		return
-	end
+	local ok, err = common.set_lines(buf, lines)
 
-	vim.bo[buf].modifiable = true
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-	vim.bo[buf].modifiable = false
+	if not ok then
+		report_internal_error("Hierarchy buffer içeriği güncellenemedi", err)
+	end
 end
 
 -- ─────────────────────────────────────────────────────────────
@@ -318,189 +132,31 @@ end
 -- ─────────────────────────────────────────────────────────────
 
 local function safe_extmark(buf, row, col, opts)
-	if not valid_buf(buf) then
-		return nil
-	end
-
-	local line_count = vim.api.nvim_buf_line_count(buf)
-
-	if line_count <= 0 then
-		return nil
-	end
-
-	row = math.max(0, math.min(row or 0, line_count - 1))
-
-	local text = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ""
-	col = math.max(0, math.min(col or 0, #text))
-
-	opts = vim.deepcopy(opts or {})
-
-	if opts.end_row ~= nil then
-		opts.end_row = math.max(row, math.min(opts.end_row, line_count - 1))
-	end
-
-	if opts.end_col ~= nil then
-		local end_row = opts.end_row or row
-		local end_text = vim.api.nvim_buf_get_lines(buf, end_row, end_row + 1, false)[1] or ""
-		local min_col = end_row == row and col or 0
-		opts.end_col = math.max(min_col, math.min(opts.end_col, #end_text))
-	end
-
-	opts.strict = false
-
-	local ok, id = pcall(vim.api.nvim_buf_set_extmark, buf, ns, row, col, opts)
-
-	if not ok then
-		report_internal_error("Extmark oluşturulamadı", id)
-		return nil
-	end
-
-	return id
+	return common.safe_extmark(ns, report_internal_error, buf, row, col, opts)
 end
 
 local function highlight_literal(buf, row, text, needle, hl)
-	if not needle or needle == "" then
-		return
-	end
-
-	local start_col = text:find(needle, 1, true)
-
-	if not start_col then
-		return
-	end
-
-	start_col = start_col - 1
-	local end_col = math.min(start_col + #needle, #text)
-
-	if end_col <= start_col then
-		return
-	end
-
-	safe_extmark(buf, row, start_col, {
-		end_col = end_col,
-		hl_group = hl,
-	})
+	common.highlight_literal(ns, report_internal_error, buf, row, text, needle, hl)
 end
 
 -- ─────────────────────────────────────────────────────────────
 -- LSP Position Conversion
 -- ─────────────────────────────────────────────────────────────
 
-local function lsp_character_to_byte(text, character, encoding)
-	text = text or ""
-	character = math.max(0, character or 0)
-
-	local ok, byte_col = pcall(vim.str_byteindex, text, encoding or "utf-16", character, false)
-
-	if not ok or byte_col == nil then
-		return math.min(character, #text)
-	end
-
-	return math.max(0, math.min(byte_col, #text))
-end
-
-local function clamp_position_in_lines(lines, position, encoding)
-	lines = safe_table(lines)
-
-	if #lines == 0 then
-		return 0, 0
-	end
-
-	local row = math.max(0, math.min(position and position.line or 0, #lines - 1))
-	local text = lines[row + 1] or ""
-	local col = lsp_character_to_byte(text, position and position.character or 0, encoding)
-
-	return row, col
-end
+local clamp_position_in_lines = common.clamp_position_in_lines
 
 -- ─────────────────────────────────────────────────────────────
 -- Source Preview
 -- ─────────────────────────────────────────────────────────────
 
-local function loaded_buffer_for_file(file)
-	if not file or file == "" then
-		return nil
-	end
-
-	local candidate = vim.fn.bufnr(file)
-
-	if candidate > 0 and loaded_buf(candidate) then
-		return candidate
-	end
-
-	return nil
-end
+local loaded_buffer_for_file = common.loaded_buffer_for_file
 
 local function source_descriptor(uri)
-	local file = uri_to_file(uri)
-
-	if not file then
-		return nil
-	end
-
-	local buf = loaded_buffer_for_file(file)
-
-	if buf then
-		local tick = vim.api.nvim_buf_get_changedtick(buf)
-		local ft = vim.bo[buf].filetype
-
-		if ft == "" then
-			ft = vim.filetype.match({ filename = file }) or ""
-		end
-
-		return {
-			buf = buf,
-			file = file,
-			ft = ft,
-			token = string.format("buf:%d:%d:%s", buf, tick, ft),
-		}
-	end
-
-	local stat = vim.uv.fs_stat(file)
-
-	if not stat or stat.type ~= "file" then
-		return nil
-	end
-
-	local mtime = stat.mtime or {}
-	local ft = vim.filetype.match({ filename = file }) or ""
-	local token = string.format(
-		"disk:%s:%s:%s:%s",
-		tostring(stat.size or 0),
-		tostring(mtime.sec or 0),
-		tostring(mtime.nsec or 0),
-		ft
-	)
-
-	return {
-		buf = nil,
-		file = file,
-		ft = ft,
-		token = token,
-	}
+	return common.source_descriptor(uri, mark_relevant_buffer)
 end
 
 local function read_source_lines(descriptor)
-	if not descriptor then
-		return nil
-	end
-
-	if loaded_buf(descriptor.buf) then
-		return vim.api.nvim_buf_get_lines(descriptor.buf, 0, -1, false)
-	end
-
-	local ok, lines = pcall(vim.fn.readfile, descriptor.file)
-
-	if not ok then
-		report_internal_error("Preview dosyası okunamadı", lines)
-		return nil
-	end
-
-	if #lines == 0 then
-		return { "" }
-	end
-
-	return lines
+	return common.read_source_lines(descriptor, report_internal_error)
 end
 
 local function invalidate_preview_cache(clear_syntax)
@@ -535,28 +191,7 @@ end
 -- LSP Client Helpers
 -- ─────────────────────────────────────────────────────────────
 
-local function preferred_client_for_buffer(buf, method)
-	if not buf then
-		return nil
-	end
-
-	local clients = vim.lsp.get_clients({
-		bufnr = buf,
-		method = method,
-	})
-
-	if #clients == 0 then
-		return nil
-	end
-
-	for _, client in ipairs(clients) do
-		if client.name == "clangd" then
-			return client
-		end
-	end
-
-	return clients[1]
-end
+local preferred_client_for_buffer = common.preferred_client_for_buffer
 
 local function active_client()
 	if not state.active_client_id then
@@ -575,10 +210,12 @@ local function request_buffer_for_item(client, item)
 	local item_buf = file and loaded_buffer_for_file(file) or nil
 
 	if item_buf and client_attached_to_buffer(client, item_buf) then
+		mark_relevant_buffer(item_buf)
 		return item_buf
 	end
 
 	if client_attached_to_buffer(client, state.source_buf) then
+		mark_relevant_buffer(state.source_buf)
 		return state.source_buf
 	end
 
@@ -716,67 +353,9 @@ end
 -- Call Hierarchy Model
 -- ─────────────────────────────────────────────────────────────
 
-local function nonnegative_integer(value)
-	return type(value) == "number" and value >= 0 and value < math.huge and value % 1 == 0
-end
-
-local function valid_position(position)
-	return type(position) == "table" and nonnegative_integer(position.line) and nonnegative_integer(position.character)
-end
-
-local function position_before_or_equal(a, b)
-	if a.line ~= b.line then
-		return a.line < b.line
-	end
-
-	return a.character <= b.character
-end
-
-local function valid_range(range)
-	return type(range) == "table"
-		and valid_position(range.start)
-		and valid_position(range["end"])
-		and position_before_or_equal(range.start, range["end"])
-end
-
-local function range_contains(outer, inner)
-	return valid_range(outer)
-		and valid_range(inner)
-		and position_before_or_equal(outer.start, inner.start)
-		and position_before_or_equal(inner["end"], outer["end"])
-end
-
-local function valid_item(item)
-	return type(item) == "table"
-		and type(item.name) == "string"
-		and item.name ~= ""
-		and nonnegative_integer(item.kind)
-		and item.kind >= 1
-		and type(item.uri) == "string"
-		and item.uri ~= ""
-		and valid_range(item.range)
-		and valid_range(item.selectionRange)
-		and range_contains(item.range, item.selectionRange)
-end
-
-local function item_signature(item)
-	if not valid_item(item) then
-		return "<invalid>"
-	end
-
-	local start = item.selectionRange.start
-	local finish = item.selectionRange["end"]
-
-	return table.concat({
-		item.uri,
-		item.name,
-		tostring(item.kind or 0),
-		tostring(start.line),
-		tostring(start.character),
-		tostring(finish.line),
-		tostring(finish.character),
-	}, "\31")
-end
+local valid_range = common.valid_range
+local valid_item = common.valid_item
+local item_signature = common.item_signature
 
 local function range_signature(range)
 	if not valid_range(range) then
@@ -867,6 +446,18 @@ local function child_node(parent, item, ranges, callsite_uri)
 	local depth = parent.depth + 1
 	local cycle = ancestry_contains(parent, signature)
 	local depth_limited = depth >= MAX_DEPTH
+
+	-- Hierarchy items and call sites can live in already-open source buffers.
+	-- Track only buffers that the current tree actually references so unrelated
+	-- clangd buffers cannot invalidate this UI session.
+	for _, uri in ipairs({ item.uri, callsite_uri }) do
+		local file = uri_to_file(uri)
+		local buf = file and loaded_buffer_for_file(file) or nil
+
+		if buf then
+			mark_relevant_buffer(buf)
+		end
+	end
 
 	return {
 		key = parent.key .. "\30" .. signature,
@@ -967,21 +558,7 @@ local function current_root()
 	return state.trees[state.direction]
 end
 
-local function flatten_tree(node, output)
-	if not node then
-		return
-	end
-
-	table.insert(output, node)
-
-	if not node.expanded then
-		return
-	end
-
-	for _, child in ipairs(node.children or {}) do
-		flatten_tree(child, output)
-	end
-end
+local flatten_tree = common.flatten_tree
 
 local function calculate_visible()
 	local output = {}
@@ -994,157 +571,22 @@ end
 -- ─────────────────────────────────────────────────────────────
 
 local function geometry()
-	local columns = math.max(1, vim.o.columns)
-	local screen_lines = math.max(1, vim.o.lines - vim.o.cmdheight)
-
-	if columns < 50 or screen_lines < 15 then
-		return nil, string.format("Terminal çok küçük (%dx%d). En az 50x15 gerekir.", columns, screen_lines)
-	end
-
-	local margin_x = columns >= 78 and 2 or 1
-	local margin_y = screen_lines >= 20 and 1 or 0
-
-	local max_frame_width = columns - (margin_x * 2)
-	local max_frame_height = screen_lines - (margin_y * 2)
-	local frame_width = math.min(max_frame_width, math.max(50, math.floor(columns * 0.94)))
-	local frame_height = math.min(max_frame_height, math.max(15, math.floor(screen_lines * 0.86)))
-
-	local horizontal_gap = frame_width >= 76 and 1 or 0
-	local vertical_gap = frame_height >= 20 and 1 or 0
-	local border_width = 2
-	local border_height = 2
-
-	local header_height = frame_height >= 18 and 3 or 2
-	local footer_height = frame_height >= 17 and 2 or 1
-
-	local reserved_height = header_height + footer_height + (border_height * 3) + (vertical_gap * 2)
-	local body_height = frame_height - reserved_height
-
-	if body_height < 1 then
-		return nil, "Terminal yüksekliği Call Hierarchy yerleşimi için yetersiz."
-	end
-
-	local body_content_width = frame_width - horizontal_gap - (border_width * 2)
-
-	if body_content_width < 2 then
-		return nil, "Terminal genişliği Call Hierarchy yerleşimi için yetersiz."
-	end
-
-	local left_width = math.max(1, math.floor(body_content_width * 0.43))
-	local right_width = body_content_width - left_width
-
-	if right_width < 1 then
-		return nil, "Terminal genişliği Source Preview için yetersiz."
-	end
-
-	local col = math.max(0, math.floor((columns - frame_width) / 2))
-	local row = math.max(0, math.floor((screen_lines - frame_height) / 2))
-	local header_width = frame_width - border_width
-	local footer_width = header_width
-	local body_row = row + header_height + border_height + vertical_gap
-	local right_col = col + left_width + border_width + horizontal_gap
-	local footer_row = body_row + body_height + border_height + vertical_gap
-
-	return {
-		row = row,
-		col = col,
-		frame_width = frame_width,
-		frame_height = frame_height,
-		header_width = header_width,
-		footer_width = footer_width,
-		header_height = header_height,
-		footer_height = footer_height,
-		body_height = body_height,
-		left_width = left_width,
-		right_width = right_width,
-		body_row = body_row,
-		right_col = right_col,
-		footer_row = footer_row,
-	}
+	return common.geometry("Call Hierarchy")
 end
 
-local function float_config(row, col, width, height, title, focusable)
-	return {
-		relative = "editor",
-		row = row,
-		col = col,
-		width = math.max(1, width),
-		height = math.max(1, height),
-		style = "minimal",
-		border = "rounded",
-		title = title,
-		title_pos = "center",
-		focusable = focusable ~= false,
-		zindex = 65,
-	}
-end
-
-local function truncate_display(text, max_width)
-	text = tostring(text or "")
-	max_width = math.max(1, max_width or 1)
-
-	if vim.fn.strdisplaywidth(text) <= max_width then
-		return text
-	end
-
-	if max_width <= 1 then
-		return "…"
-	end
-
-	local chars = vim.fn.strchars(text)
-	local low = 0
-	local high = chars
-	local target = max_width - 1
-
-	while low < high do
-		local mid = math.ceil((low + high) / 2)
-		local candidate = vim.fn.strcharpart(text, 0, mid)
-
-		if vim.fn.strdisplaywidth(candidate) <= target then
-			low = mid
-		else
-			high = mid - 1
-		end
-	end
-
-	return vim.fn.strcharpart(text, 0, low) .. "…"
-end
+local float_config = common.float_config
+local truncate_display = common.truncate_display
 
 -- ─────────────────────────────────────────────────────────────
 -- Selection Helpers
 -- ─────────────────────────────────────────────────────────────
 
 local function selected_node()
-	if not valid_win(state.wins.list) then
-		return nil
-	end
-
-	local line = vim.api.nvim_win_get_cursor(state.wins.list)[1]
-
-	if state.line_map[line] then
-		return state.line_map[line]
-	end
-
-	for offset = 1, 30 do
-		local down = state.line_map[line + offset]
-
-		if down then
-			return down
-		end
-
-		local up = state.line_map[line - offset]
-
-		if up then
-			return up
-		end
-	end
-
-	return nil
+	return common.selected_node(state)
 end
 
 local function selected_key()
-	local node = selected_node()
-	return node and node.key or nil
+	return common.selected_key(state)
 end
 
 -- ─────────────────────────────────────────────────────────────
@@ -1261,6 +703,12 @@ local function render_list(preferred_key)
 			"   󰄬  No call hierarchy items",
 		}
 		set_lines(state.bufs.list, lines)
+		vim.api.nvim_buf_clear_namespace(state.bufs.list, ns, 0, -1)
+
+		if valid_win(state.wins.list) then
+			pcall(vim.api.nvim_win_set_cursor, state.wins.list, { 1, 0 })
+		end
+
 		return
 	end
 
@@ -1583,6 +1031,7 @@ local function request_children(node)
 
 	local session_id = state.session_id
 	local generation = state.request_generation[direction] or 0
+	local request_tick = loaded_buf(request_buf) and vim.api.nvim_buf_get_changedtick(request_buf) or nil
 
 	node.loading = true
 	node.load_error = nil
@@ -1595,6 +1044,21 @@ local function request_children(node)
 			or state.session_id ~= session_id
 			or generation ~= (state.request_generation[direction] or 0)
 		then
+			return
+		end
+
+		if
+			request_tick
+			and loaded_buf(request_buf)
+			and vim.api.nvim_buf_get_changedtick(request_buf) ~= request_tick
+		then
+			node.loading = false
+			node.loaded = false
+			node.load_error = "Kaynak buffer değişti; hiyerarşiyi yeniden açın."
+
+			if state.direction == direction then
+				refresh()
+			end
 			return
 		end
 
@@ -1774,19 +1238,7 @@ end
 -- Close / Cleanup
 -- ─────────────────────────────────────────────────────────────
 
-local function cleanup_ui(wins, bufs)
-	for _, win in pairs(wins or {}) do
-		if valid_win(win) then
-			pcall(vim.api.nvim_win_close, win, true)
-		end
-	end
-
-	for _, buf in pairs(bufs or {}) do
-		if valid_buf(buf) then
-			pcall(vim.api.nvim_buf_delete, buf, { force = true })
-		end
-	end
-end
+local cleanup_ui = common.cleanup_ui
 
 local function clear_session_state()
 	state.preparing = false
@@ -1801,6 +1253,7 @@ local function clear_session_state()
 	state.project_root = nil
 	state.root_item = nil
 	state.roots = {}
+	state.relevant_buffers = {}
 	state.trees = {
 		incoming = nil,
 		outgoing = nil,
@@ -1821,10 +1274,14 @@ local function clear_session_state()
 	state.augroup = nil
 end
 
-local function close_hierarchy()
+local function close_hierarchy(opts)
+	opts = opts or {}
+
 	if state.closing or not state.open then
 		return
 	end
+
+	local restore_focus = opts.restore_focus ~= false
 
 	state.closing = true
 	state.open = false
@@ -1850,7 +1307,10 @@ local function close_hierarchy()
 	cleanup_ui(wins, bufs)
 	clear_session_state()
 
-	if valid_win(source_win) then
+	-- Automatic lifecycle closures (TabLeave, WinClosed, source changes) must
+	-- never pull the user back into the old source window/tab. Explicit close
+	-- actions keep the existing restore-focus behavior.
+	if restore_focus and valid_win(source_win) then
 		pcall(vim.api.nvim_set_current_win, source_win)
 	end
 
@@ -1871,7 +1331,7 @@ local function show_location(location)
 	local encoding = state.encoding or "utf-16"
 	local source_win = state.source_win
 
-	close_hierarchy()
+	close_hierarchy({ restore_focus = false })
 
 	if valid_win(source_win) then
 		pcall(vim.api.nvim_set_current_win, source_win)
@@ -1979,38 +1439,7 @@ end
 -- ─────────────────────────────────────────────────────────────
 
 local function configure_window_appearance()
-	for _, win in pairs(state.wins) do
-		if valid_win(win) then
-			vim.api.nvim_set_option_value(
-				"winhighlight",
-				"Normal:NormalFloat,"
-					.. "NormalNC:NormalFloat,"
-					.. "FloatBorder:FloatBorder,"
-					.. "FloatTitle:Title,"
-					.. "CursorLine:Visual,"
-					.. "EndOfBuffer:NormalFloat",
-				{ win = win }
-			)
-
-			vim.api.nvim_set_option_value("winblend", 0, { win = win })
-			vim.api.nvim_set_option_value("wrap", false, { win = win })
-		end
-	end
-
-	vim.api.nvim_set_option_value("cursorline", true, { win = state.wins.list })
-	vim.api.nvim_set_option_value("number", false, { win = state.wins.list })
-	vim.api.nvim_set_option_value("relativenumber", false, { win = state.wins.list })
-	vim.api.nvim_set_option_value("signcolumn", "no", { win = state.wins.list })
-	vim.api.nvim_set_option_value("wrap", false, { win = state.wins.list })
-	vim.api.nvim_set_option_value("scrolloff", 3, { win = state.wins.list })
-
-	vim.api.nvim_set_option_value("number", true, { win = state.wins.preview })
-	vim.api.nvim_set_option_value("relativenumber", false, { win = state.wins.preview })
-	vim.api.nvim_set_option_value("signcolumn", "yes", { win = state.wins.preview })
-	vim.api.nvim_set_option_value("cursorline", true, { win = state.wins.preview })
-	vim.api.nvim_set_option_value("wrap", false, { win = state.wins.preview })
-	vim.api.nvim_set_option_value("scrolloff", 3, { win = state.wins.preview })
-	vim.api.nvim_set_option_value("colorcolumn", "", { win = state.wins.preview })
+	common.configure_window_appearance(state.wins)
 end
 
 local function reposition()
@@ -2154,7 +1583,7 @@ local function setup_runtime_events(session_id)
 				if win == closed then
 					vim.schedule(function()
 						if state.open and not state.closing and state.session_id == session_id then
-							close_hierarchy()
+							close_hierarchy({ restore_focus = false })
 						end
 					end)
 					return
@@ -2165,20 +1594,28 @@ local function setup_runtime_events(session_id)
 
 	vim.api.nvim_create_autocmd("LspDetach", {
 		group = state.augroup,
-		buffer = state.source_buf,
 		callback = function(args)
 			if not state.open or state.session_id ~= session_id then
 				return
 			end
 
-			if args.data and args.data.client_id == state.active_client_id then
-				vim.schedule(function()
-					if state.open and state.session_id == session_id then
-						notify("Call Hierarchy LSP client'tan ayrıldığı için kapatıldı.", vim.log.levels.WARN)
-						close_hierarchy()
-					end
-				end)
+			if not args.data or args.data.client_id ~= state.active_client_id then
+				return
 			end
+
+			local detached_buf = args.buf
+			local relevant = detached_buf == state.source_buf or state.relevant_buffers[detached_buf] == true
+
+			if not relevant then
+				return
+			end
+
+			vim.schedule(function()
+				if state.open and state.session_id == session_id then
+					notify("Call Hierarchy ilgili LSP buffer'ından ayrıldığı için kapatıldı.", vim.log.levels.WARN)
+					close_hierarchy({ restore_focus = false })
+				end
+			end)
 		end,
 	})
 
@@ -2189,13 +1626,8 @@ local function setup_runtime_events(session_id)
 				return
 			end
 
-			local client = active_client()
 			local changed_buf = args.buf
-			local relevant = changed_buf == state.source_buf
-
-			if not relevant and client and valid_buf(changed_buf) then
-				relevant = vim.lsp.buf_is_attached(changed_buf, client.id)
-			end
+			local relevant = changed_buf == state.source_buf or state.relevant_buffers[changed_buf] == true
 
 			if not relevant then
 				return
@@ -2207,7 +1639,7 @@ local function setup_runtime_events(session_id)
 						"İlgili bir LSP buffer'ı değiştiği için Call Hierarchy kapatıldı; yeniden açın.",
 						vim.log.levels.INFO
 					)
-					close_hierarchy()
+					close_hierarchy({ restore_focus = false })
 				end
 			end)
 		end,
@@ -2222,7 +1654,7 @@ local function setup_runtime_events(session_id)
 
 			vim.schedule(function()
 				if state.open and state.session_id == session_id then
-					close_hierarchy()
+					close_hierarchy({ restore_focus = false })
 				end
 			end)
 		end,
@@ -2230,15 +1662,23 @@ local function setup_runtime_events(session_id)
 
 	vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
 		group = state.augroup,
-		buffer = state.source_buf,
-		callback = function()
-			if state.open and state.session_id == session_id then
-				vim.schedule(function()
-					if state.open and state.session_id == session_id then
-						close_hierarchy()
-					end
-				end)
+		callback = function(args)
+			if not state.open or state.session_id ~= session_id then
+				return
 			end
+
+			local affected_buf = args.buf
+			local relevant = affected_buf == state.source_buf or state.relevant_buffers[affected_buf] == true
+
+			if not relevant then
+				return
+			end
+
+			vim.schedule(function()
+				if state.open and state.session_id == session_id then
+					close_hierarchy({ restore_focus = false })
+				end
+			end)
 		end,
 	})
 end
@@ -2305,8 +1745,10 @@ local function open_ui(client, item, source_buf, source_win, source_file, source
 	state.source_tick = source_tick or vim.api.nvim_buf_get_changedtick(source_buf)
 	state.active_client_id = live_client.id
 	state.encoding = live_client.offset_encoding or "utf-16"
-	state.project_root, state.roots = collect_client_roots(live_client, source_file)
+	state.project_root, state.roots = workspace.collect_roots(live_client, source_file)
 	state.root_item = item
+	state.relevant_buffers = {}
+	mark_relevant_buffer(source_buf)
 	state.trees = {
 		incoming = root_node(item, "incoming"),
 		outgoing = nil,

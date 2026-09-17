@@ -52,6 +52,25 @@ vim.lsp.config("lua_ls", {
 })
 
 -- ─────────────────────────────────────────────────────────────
+-- Server-Specific Configuration
+-- ─────────────────────────────────────────────────────────────
+
+-- Server-specific overrides must be registered before vim.lsp.enable().
+-- demir.lsp.clangd configures the clangd command while preserving the
+-- configuration supplied by nvim-lspconfig.
+require("demir.lsp.clangd")
+
+-- ─────────────────────────────────────────────────────────────
+-- LSP Runtime Behavior
+-- ─────────────────────────────────────────────────────────────
+
+-- Register the LspAttach handler before enabling any server.
+--
+-- vim.lsp.enable() also checks already-existing matching buffers, so the
+-- handler must be ready before a client has an opportunity to attach.
+require("demir.lsp.keymaps")
+
+-- ─────────────────────────────────────────────────────────────
 -- Language Servers
 -- ─────────────────────────────────────────────────────────────
 
@@ -73,4 +92,3 @@ vim.lsp.enable(servers)
 
 require("demir.lsp.call_hierarchy")
 require("demir.lsp.type_hierarchy")
-require("demir.lsp.clangd")

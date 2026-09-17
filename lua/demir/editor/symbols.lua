@@ -1,6 +1,12 @@
 local Snacks = require("snacks")
+local workspace = require("demir.lsp.workspace")
 
 local M = {}
+
+local unpack_args = table.unpack or unpack
+local pack_args = table.pack or function(...)
+	return { n = select("#", ...), ... }
+end
 
 local ns = vim.api.nvim_create_namespace("DemirSymbolCenter")
 
@@ -304,21 +310,6 @@ local function uri_to_file(uri)
 	return normalize_path(file)
 end
 
-local function path_in_root(root, file)
-	root = normalize_path(root)
-	file = normalize_path(file)
-
-	if root == "" or file == "" then
-		return false
-	end
-
-	if root == file then
-		return true
-	end
-
-	return vim.fs.relpath(root, file) ~= nil
-end
-
 local function relative_file(file)
 	file = normalize_path(file)
 
@@ -326,16 +317,21 @@ local function relative_file(file)
 		return ""
 	end
 
+	-- Fast path for the overwhelmingly common non-symlink case. Workspace
+	-- roots are already normalized/canonicalized by demir.lsp.workspace.
 	for _, root in ipairs(state.roots or {}) do
 		local relative = vim.fs.relpath(root, file)
 
 		if relative then
-			if relative == "." then
-				return vim.fs.basename(file)
-			end
-
-			return relative
+			return relative == "." and vim.fs.basename(file) or relative
 		end
+	end
+
+	-- Resolve symlink aliases only when lexical containment failed.
+	local relative = workspace.relative_path(state.roots, file)
+
+	if relative then
+		return relative == "." and vim.fs.basename(file) or relative
 	end
 
 	return vim.fs.basename(file)
@@ -349,7 +345,15 @@ local function inside_project(file)
 	end
 
 	for _, root in ipairs(state.roots or {}) do
-		if path_in_root(root, file) then
+		if file == root or vim.fs.relpath(root, file) ~= nil then
+			return true
+		end
+	end
+
+	-- Slow path handles a source/result path that reaches the same physical
+	-- workspace through a different symlink spelling.
+	for _, root in ipairs(state.roots or {}) do
+		if workspace.path_in_root(root, file) then
 			return true
 		end
 	end
@@ -562,14 +566,42 @@ local function node_contains_position(node, line, col)
 end
 
 local function loaded_buffer_for_file(file, preferred_buf)
+	file = normalize_path(file)
+
+	if file == "" then
+		return nil
+	end
+
 	if loaded_buf(preferred_buf) then
-		return preferred_buf
+		local preferred_name = normalize_path(vim.api.nvim_buf_get_name(preferred_buf))
+
+		if preferred_name == file
+			or workspace.canonical_path(preferred_name) == workspace.canonical_path(file)
+		then
+			return preferred_buf
+		end
 	end
 
 	local candidate = vim.fn.bufnr(file)
 
 	if candidate > 0 and loaded_buf(candidate) then
 		return candidate
+	end
+
+	local target = workspace.canonical_path(file)
+
+	if target == "" then
+		return nil
+	end
+
+	for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+		if loaded_buf(buf) then
+			local name = normalize_path(vim.api.nvim_buf_get_name(buf))
+
+			if name ~= "" and workspace.canonical_path(name) == target then
+				return buf
+			end
+		end
 	end
 
 	return nil
@@ -694,66 +726,8 @@ local function preferred_client(method)
 	return preferred_client_for_buffer(state.source_buf, method)
 end
 
-local function collect_client_roots(client, source_file)
-	local roots = {}
-	local seen = {}
-
-	local function add_root(root)
-		root = normalize_path(root)
-
-		if root == "" or seen[root] then
-			return
-		end
-
-		seen[root] = true
-		table.insert(roots, root)
-	end
-
-	local workspace_folders = client and client.workspace_folders
-	workspace_folders = type(workspace_folders) == "table" and workspace_folders or {}
-
-	for _, folder in ipairs(workspace_folders) do
-		if type(folder) == "table" and folder.uri then
-			local root = uri_to_file(folder.uri)
-
-			if root then
-				add_root(root)
-			end
-		end
-	end
-
-	if client and client.root_dir then
-		add_root(client.root_dir)
-	end
-
-	if #roots == 0 then
-		local fallback = vim.fs.root(source_file, {
-			"CMakePresets.json",
-			"CMakeLists.txt",
-			".git",
-		})
-
-		add_root(fallback or vim.fn.getcwd())
-	end
-
-	table.sort(roots, function(a, b)
-		return #a > #b
-	end)
-
-	local primary = nil
-
-	for _, root in ipairs(roots) do
-		if path_in_root(root, source_file) then
-			primary = root
-			break
-		end
-	end
-
-	return primary or roots[1], roots
-end
-
 local function set_project_roots(client)
-	state.root, state.roots = collect_client_roots(client, state.source_file)
+	state.root, state.roots = workspace.collect_roots(client, state.source_file)
 end
 
 local function cancel_requests()
@@ -787,7 +761,11 @@ local function untrack_request(client, request_id)
 end
 
 local function request_from_client(client, method, params, handler)
-	if not client or not state.source_buf then
+	if not client or not state.source_buf or not valid_buf(state.source_buf) then
+		return false
+	end
+
+	if client.is_stopped and client:is_stopped() then
 		return false
 	end
 
@@ -801,19 +779,47 @@ local function request_from_client(client, method, params, handler)
 			untrack_request(client, request_id)
 		end
 
-		return handler(...)
+		local args = pack_args(...)
+		local ok, err = xpcall(function()
+			handler(unpack_args(args, 1, args.n))
+		end, debug.traceback)
+
+		if not ok then
+			report_internal_error("LSP symbol callback'i başarısız", err)
+		end
 	end
 
-	local ok, id = client:request(method, params, wrapped_handler, state.source_buf)
+	local call_ok, status, id = pcall(
+		client.request,
+		client,
+		method,
+		params,
+		wrapped_handler,
+		state.source_buf
+	)
+
+	if not call_ok then
+		report_internal_error("LSP symbol isteği gönderilirken hata oluştu", status)
+		return false
+	end
+
 	request_id = id
+
+	if status ~= true then
+		return false
+	end
 
 	-- Normal RPC yanıtı asenkrondur. In-process/test client callback'i request()
 	-- dönmeden çalıştırırsa tamamlanmış request'i pending listesine geri ekleme.
-	if ok and request_id and not completed then
+	if not completed then
+		if not request_id then
+			return false
+		end
+
 		track_request(client, request_id)
 	end
 
-	return ok == true
+	return true
 end
 
 -- ─────────────────────────────────────────────────────────────
@@ -1142,6 +1148,7 @@ local function request_workspace_symbols(query)
 		return
 	end
 
+	state.active_client_id = client.id
 	set_project_roots(client)
 
 	local ok = request_from_client(client, "workspace/symbol", {

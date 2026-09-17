@@ -1,17 +1,10 @@
 local M = {}
 
+local project = require("demir.core.project")
+
 local severity = vim.diagnostic.severity
 
 local DEEP_CONFIG = vim.fs.normalize(vim.fn.expand("~/.config/clang-tidy/deep.yaml"))
-
-local ROOT_MARKERS = {
-	git = ".git",
-	cmake_presets = {
-		"CMakePresets.json",
-		"CMakeUserPresets.json",
-	},
-	cmake = "CMakeLists.txt",
-}
 
 local DEFAULT_MAX_DATABASES = 64
 local DEFAULT_JOBS_FALLBACK = 4
@@ -46,12 +39,15 @@ local state = {
 		timeouts = 0,
 
 		stale = false,
+		buffer_snapshots = {},
 	},
 
 	last_attempt = {
 		ok = nil,
 		reason = nil,
 		detail = nil,
+		root = nil,
+		database = nil,
 	},
 }
 
@@ -105,11 +101,14 @@ local function file_signature(path)
 	end
 
 	local mtime = stat.mtime or {}
+	local ctime = stat.ctime or {}
 
 	return table.concat({
 		tostring(stat.size or 0),
 		tostring(mtime.sec or 0),
 		tostring(mtime.nsec or 0),
+		tostring(ctime.sec or 0),
+		tostring(ctime.nsec or 0),
 	}, ":")
 end
 
@@ -286,36 +285,14 @@ local function context_buffer()
 	return nil
 end
 
-local function root_from_source(source)
-	local git = vim.fs.root(source, ROOT_MARKERS.git)
-
-	if git then
-		return canonical_path(git)
-	end
-
-	local presets = vim.fs.root(source, ROOT_MARKERS.cmake_presets)
-
-	if presets then
-		return canonical_path(presets)
-	end
-
-	local cmake = vim.fs.root(source, ROOT_MARKERS.cmake)
-
-	if cmake then
-		return canonical_path(cmake)
-	end
-
-	return canonical_path(vim.fn.getcwd())
-end
-
 local function current_project_root()
 	local buf = context_buffer()
 
 	if buf then
-		return root_from_source(buf)
+		return project.analysis_root(buf)
 	end
 
-	return root_from_source(vim.fn.getcwd())
+	return project.analysis_root(vim.fn.getcwd())
 end
 
 -- ─────────────────────────────────────────────────────────────
@@ -348,6 +325,8 @@ local function status_snapshot()
 
 			elapsed_ms = elapsed_ms(active.started_ns),
 
+			committed_root = state.last.root,
+			committed_database = state.last.database,
 			committed_issues = #state.results,
 			stale = state.last.stale == true,
 
@@ -371,6 +350,8 @@ local function status_snapshot()
 		timeouts = state.last.timeouts,
 		elapsed_ms = state.last.elapsed_ms,
 
+		committed_root = state.last.root,
+		committed_database = state.last.database,
 		committed_issues = #state.results,
 		stale = state.last.stale == true,
 
@@ -979,6 +960,202 @@ local function translation_units_changed(run)
 	return false
 end
 
+local ANALYSIS_INPUT_EXTENSIONS = {
+	[".c"] = true,
+	[".cc"] = true,
+	[".cpp"] = true,
+	[".cxx"] = true,
+	[".c++"] = true,
+	[".h"] = true,
+	[".hh"] = true,
+	[".hpp"] = true,
+	[".hxx"] = true,
+	[".h++"] = true,
+	[".inc"] = true,
+	[".inl"] = true,
+	[".ipp"] = true,
+	[".tpp"] = true,
+	[".def"] = true,
+	[".m"] = true,
+	[".mm"] = true,
+	[".ixx"] = true,
+	[".cppm"] = true,
+	[".ccm"] = true,
+	[".cxxm"] = true,
+	[".mpp"] = true,
+	[".cu"] = true,
+	[".cuh"] = true,
+}
+
+local INTEGRITY_SKIP_DIRECTORIES = {
+	[".git"] = true,
+	[".hg"] = true,
+	[".svn"] = true,
+}
+
+local function analysis_input_candidate(path)
+	local basename = vim.fs.basename(path):lower()
+	local extension = basename:match("(%.[^./]+)$")
+
+	return extension ~= nil and ANALYSIS_INPUT_EXTENSIONS[extension] == true
+end
+
+-- Snapshot the project-local C/C++ semantic-input surface rather than the
+-- entire repository. This deliberately includes generated headers/sources in
+-- build directories while ignoring object files, caches, documentation, VCS
+-- metadata, and other files that cannot directly participate in a clang-tidy
+-- translation unit. The snapshot is stat-only, so the cost stays small next to
+-- the clang-tidy scan itself.
+local function snapshot_analysis_inputs(root)
+	root = canonical_path(root)
+
+	if root == "" or not path_is_directory(root) then
+		return nil, "Analysis root is not a readable directory."
+	end
+
+	local snapshots = {}
+	local stack = { root }
+	local seen_directories = {}
+
+	while #stack > 0 do
+		local directory = table.remove(stack)
+		local canonical_directory = canonical_path(directory)
+
+		if canonical_directory ~= "" and not seen_directories[canonical_directory] then
+			seen_directories[canonical_directory] = true
+
+			local scanner, scan_err = vim.uv.fs_scandir(directory)
+
+			if not scanner then
+				return nil, string.format("Could not inspect analysis-input directory:\n%s\n%s", directory, tostring(scan_err))
+			end
+
+			while true do
+				local name, kind = vim.uv.fs_scandir_next(scanner)
+
+				if not name then
+					break
+				end
+
+				local path = vim.fs.joinpath(directory, name)
+
+				if kind == "directory" then
+					if not INTEGRITY_SKIP_DIRECTORIES[name] then
+						table.insert(stack, path)
+					end
+				elseif kind == "file" then
+					if analysis_input_candidate(path) then
+						local file = canonical_path(path)
+
+						if file ~= "" then
+							snapshots[file] = file_signature(file)
+						end
+					end
+				elseif kind == "link" and analysis_input_candidate(path) then
+					-- Follow file symlinks but not directory symlinks. This tracks a
+					-- project header/source symlink without recursively walking an
+					-- arbitrary external tree or risking symlink-directory cycles.
+					local file = canonical_path(path)
+
+					if file ~= "" and path_is_file(file) then
+						snapshots[file] = file_signature(file)
+					end
+				end
+			end
+		end
+	end
+
+	return snapshots
+end
+
+local function analysis_inputs_changed(run)
+	local current, snapshot_err = snapshot_analysis_inputs(run.root)
+
+	if not current then
+		return true, nil, snapshot_err
+	end
+
+	for file, signature in pairs(run.input_signatures or {}) do
+		if current[file] ~= signature then
+			return true, file
+		end
+	end
+
+	for file in pairs(current) do
+		if (run.input_signatures or {})[file] == nil then
+			return true, file
+		end
+	end
+
+	return false
+end
+
+local function snapshot_project_buffers(root)
+	local snapshots = {}
+
+	for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+		if
+			vim.api.nvim_buf_is_valid(buf)
+			and vim.api.nvim_buf_is_loaded(buf)
+			and vim.bo[buf].buftype == ""
+		then
+			local file = canonical_path(vim.api.nvim_buf_get_name(buf))
+
+			if file ~= "" and inside(root, file) then
+				snapshots[buf] = {
+					file = file,
+					changedtick = vim.api.nvim_buf_get_changedtick(buf),
+				}
+			end
+		end
+	end
+
+	return snapshots
+end
+
+local function buffer_changed_since(snapshots, buf, file)
+	local baseline = snapshots and snapshots[buf] or nil
+
+	if not baseline or baseline.file ~= file then
+		return true
+	end
+
+	return vim.api.nvim_buf_get_changedtick(buf) ~= baseline.changedtick
+end
+
+local function project_buffers_changed(run)
+	for buf, baseline in pairs(run.buffer_snapshots or {}) do
+		if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) then
+			local file = canonical_path(vim.api.nvim_buf_get_name(buf))
+
+			if file ~= baseline.file then
+				return true, file ~= "" and file or baseline.file
+			end
+
+			if vim.api.nvim_buf_get_changedtick(buf) ~= baseline.changedtick then
+				return true, file
+			end
+
+			if vim.bo[buf].modified then
+				return true, file
+			end
+		end
+	end
+
+	-- Also catch a project buffer that was opened after the scan snapshot and
+	-- currently contains unsaved edits. TextChanged normally catches this case,
+	-- but this finish-time check keeps the integrity decision independent of
+	-- autocmd delivery timing.
+	local modified = modified_project_buffers(run.root)
+
+	if #modified > 0 then
+		local buf = modified[1]
+		return true, canonical_path(vim.api.nvim_buf_get_name(buf))
+	end
+
+	return false
+end
+
 -- ─────────────────────────────────────────────────────────────
 -- Process Management
 -- ─────────────────────────────────────────────────────────────
@@ -1040,6 +1217,8 @@ local function fail_run(run, reason, detail, cancelled)
 		ok = false,
 		reason = reason,
 		detail = detail,
+		root = run.root,
+		database = run.database,
 	}
 
 	if cancelled then
@@ -1063,21 +1242,38 @@ local function finish_run(run)
 		return
 	end
 
+	local compilation_model_changed = run.compilation_model_changed == true
 	local database_changed = file_signature(run.database) ~= run.database_signature
 	local config_changed = file_signature(DEEP_CONFIG) ~= run.config_signature
-	local units_changed, changed_file = translation_units_changed(run)
+	local buffers_changed, changed_buffer = project_buffers_changed(run)
+	local units_changed, changed_unit = translation_units_changed(run)
+	local inputs_changed, changed_input, input_check_error = analysis_inputs_changed(run)
+	local project_changed = run.dirty or buffers_changed
 
-	if run.dirty or database_changed or config_changed or units_changed then
+	if compilation_model_changed or project_changed or database_changed or config_changed or units_changed or inputs_changed then
 		local reason
+		local changed_file
 
-		if run.dirty then
-			reason = "project files changed while the scan was running"
+		if compilation_model_changed then
+			reason = "the active CMake compilation model changed while the scan was running"
+			changed_file = run.compilation_model_database
+		elseif project_changed then
+			reason = "project buffers changed while the scan was running"
+			changed_file = run.dirty_file or changed_buffer
 		elseif database_changed then
 			reason = "compile_commands.json changed while the scan was running"
+			changed_file = run.database
 		elseif config_changed then
 			reason = "the deep-analysis configuration changed while the scan was running"
-		else
+			changed_file = DEEP_CONFIG
+		elseif units_changed then
 			reason = "a translation unit changed outside Neovim while the scan was running"
+			changed_file = changed_unit
+		else
+			reason = input_check_error
+				and ("the project analysis-input surface could not be revalidated: " .. input_check_error)
+				or "a project C/C++ analysis input changed outside Neovim while the scan was running"
+			changed_file = changed_input
 		end
 
 		terminate_session(run)
@@ -1086,6 +1282,8 @@ local function finish_run(run)
 			ok = false,
 			reason = "Analysis results were discarded.",
 			detail = changed_file and (reason .. ":\n" .. changed_file) or reason,
+			root = run.root,
+			database = run.database,
 		}
 
 		emit("discarded")
@@ -1132,6 +1330,8 @@ local function finish_run(run)
 				run.tool_failures
 			),
 			detail = detail,
+			root = run.root,
+			database = run.database,
 		}
 
 		emit("failed")
@@ -1169,12 +1369,15 @@ local function finish_run(run)
 		timeouts = 0,
 
 		stale = false,
+		buffer_snapshots = snapshot_project_buffers(run.root),
 	}
 
 	state.last_attempt = {
 		ok = true,
 		reason = nil,
 		detail = nil,
+		root = run.root,
+		database = run.database,
 	}
 
 	terminate_session(run)
@@ -1289,6 +1492,12 @@ local function verify_configuration(run, callback)
 	emit("phase")
 
 	local sample = run.units[1]
+	local config_signature = file_signature(DEEP_CONFIG)
+
+	if not config_signature then
+		callback(false, "Deep-analysis configuration disappeared before verification.")
+		return
+	end
 
 	local command = {
 		run.clang_tidy,
@@ -1319,6 +1528,11 @@ local function verify_configuration(run, callback)
 				return
 			end
 
+			if file_signature(DEEP_CONFIG) ~= config_signature then
+				callback(false, "Deep-analysis configuration changed while it was being verified.")
+				return
+			end
+
 			if result.code ~= 0 then
 				local detail = compact_output((result.stderr or "") .. "\n" .. (result.stdout or ""), 3000)
 
@@ -1326,6 +1540,7 @@ local function verify_configuration(run, callback)
 				return
 			end
 
+			run.config_signature = config_signature
 			callback(true)
 		end)
 	end)
@@ -1357,16 +1572,33 @@ local function begin_scan(run)
 	run.completed = 0
 	run.running = 0
 
-	run.started_ns = vim.uv.hrtime()
-	run.database_signature = file_signature(run.database)
-	run.config_signature = file_signature(DEEP_CONFIG)
+	-- Capture editor and filesystem state at the exact boundary where the
+	-- disk-based scan becomes authoritative. Delayed TextChanged events from
+	-- edits that happened before this point are ignored unless changedtick has
+	-- actually advanced beyond this snapshot.
+	run.buffer_snapshots = snapshot_project_buffers(run.root)
 	run.unit_signatures = snapshot_translation_units(run.units)
+
+	local input_signatures, input_snapshot_err = snapshot_analysis_inputs(run.root)
+
+	if not input_signatures then
+		fail_run(run, "Project analysis inputs could not be snapshotted before deep analysis.", input_snapshot_err)
+		return
+	end
+
+	run.input_signatures = input_signatures
+	run.started_ns = vim.uv.hrtime()
 	run.dirty = false
+	run.dirty_file = nil
+	run.compilation_model_changed = false
+	run.compilation_model_database = nil
 
 	state.last_attempt = {
 		ok = nil,
 		reason = nil,
 		detail = nil,
+		root = run.root,
+		database = run.database,
 	}
 
 	emit("started")
@@ -1381,6 +1613,58 @@ local function begin_scan(run)
 	)
 
 	pump(run)
+end
+
+local function finalize_preparation(run, opts)
+	run.phase = "finalizing"
+	emit("phase")
+
+	-- Database discovery and config verification are asynchronous. Re-check
+	-- project buffers immediately before the scan so an edit made during those
+	-- phases cannot slip through the initial save barrier.
+	prepare_modified_buffers(run, opts, function(ok, err, cancelled)
+		if state.active ~= run or run.generation ~= state.generation or run.cancelled then
+			return
+		end
+
+		if not ok then
+			fail_run(run, err or "Final analysis preparation failed.", nil, cancelled)
+			return
+		end
+
+		local remaining_modified = modified_project_buffers(run.root)
+
+		if #remaining_modified > 0 then
+			local file = canonical_path(vim.api.nvim_buf_get_name(remaining_modified[1]))
+
+			fail_run(
+				run,
+				"Project files changed while deep analysis was being prepared.",
+				file ~= "" and file or nil
+			)
+			return
+		end
+
+		if file_signature(run.database) ~= run.database_signature then
+			fail_run(
+				run,
+				"Compilation database changed while deep analysis was being prepared.",
+				run.database
+			)
+			return
+		end
+
+		if file_signature(DEEP_CONFIG) ~= run.config_signature then
+			fail_run(
+				run,
+				"Deep-analysis configuration changed while the scan was being prepared.",
+				DEEP_CONFIG
+			)
+			return
+		end
+
+		begin_scan(run)
+	end)
 end
 
 local function prepare_database(run, opts)
@@ -1403,6 +1687,13 @@ local function prepare_database(run, opts)
 		run.phase = "loading_database"
 		emit("phase")
 
+		local database_signature_before = file_signature(run.database)
+
+		if not database_signature_before then
+			fail_run(run, "Compilation database disappeared before it could be loaded.", run.database)
+			return
+		end
+
 		local units, load_err = load_database(run.root, run.database)
 
 		if not units then
@@ -1410,6 +1701,14 @@ local function prepare_database(run, opts)
 			return
 		end
 
+		local database_signature_after = file_signature(run.database)
+
+		if database_signature_after ~= database_signature_before then
+			fail_run(run, "Compilation database changed while it was being loaded.", run.database)
+			return
+		end
+
+		run.database_signature = database_signature_after
 		run.units = units
 		run.total = #units
 
@@ -1423,7 +1722,7 @@ local function prepare_database(run, opts)
 				return
 			end
 
-			begin_scan(run)
+			finalize_preparation(run, opts)
 		end)
 	end)
 end
@@ -1534,6 +1833,55 @@ function M.status()
 	return status_snapshot()
 end
 
+---Invalidate cached compilation-model state for one analysis root.
+---
+---This is intentionally separate from source freshness. A CMake profile or
+---configure change can alter compiler flags and the selected compilation
+---database without modifying any source buffer.
+---@param root string
+---@param database? string
+---@param reason? string
+---@return boolean
+function M.invalidate_compilation_model(root, database, reason)
+	root = canonical_path(root)
+
+	if root == "" then
+		return false
+	end
+
+	-- If CMake supplied a valid active database, make it the next automatic
+	-- deep-analysis choice. This both invalidates the old remembered profile and
+	-- follows DemirVim's source-root compile_commands.json ownership model. An
+	-- explicit vim.g.demir_clang_tidy_database still takes precedence later.
+	local normalized_database = normalize_database_option(database, root)
+	remembered_databases[root] = normalized_database
+
+	database = normalized_database or canonical_path(database)
+	reason = type(reason) == "string" and reason ~= "" and reason or "CMake compilation model changed"
+
+	local active = state.active
+
+	if active and canonical_path(active.root) == root then
+		if active.phase == "running" then
+			active.compilation_model_changed = true
+			active.compilation_model_database = database ~= "" and database or nil
+		else
+			fail_run(
+				active,
+				"Deep analysis was invalidated by a CMake compilation-model change.",
+				reason .. (database ~= "" and ("\nCompilation database: " .. database) or "")
+			)
+		end
+	end
+
+	if state.last.root and canonical_path(state.last.root) == root and not state.last.stale then
+		state.last.stale = true
+		emit("stale")
+	end
+
+	return true
+end
+
 function M.clear()
 	if state.active then
 		notify("Deep-analysis results cannot be cleared while an analysis request is active.", vim.log.levels.WARN)
@@ -1558,12 +1906,15 @@ function M.clear()
 		timeouts = 0,
 
 		stale = false,
+		buffer_snapshots = {},
 	}
 
 	state.last_attempt = {
 		ok = nil,
 		reason = nil,
 		detail = nil,
+		root = nil,
+		database = nil,
 	}
 
 	emit("cleared")
@@ -1592,6 +1943,8 @@ function M.cancel()
 		ok = false,
 		reason = "Analysis cancelled.",
 		detail = nil,
+		root = run.root,
+		database = run.database,
 	}
 
 	emit("cancelled")
@@ -1621,7 +1974,11 @@ local freshness_group = vim.api.nvim_create_augroup("DemirDeepAnalysisFreshness"
 })
 
 local function mark_project_changed(buf)
-	if not vim.api.nvim_buf_is_valid(buf) then
+	-- TextChanged* also fires for plugin-owned scratch buffers. Deep-analysis
+	-- freshness only tracks normal file buffers; treating a nofile URI such as
+	-- demir://problems/list/... as a filesystem path can create a false
+	-- project mutation and discard an otherwise valid scan.
+	if not normal_file_buffer(buf) then
 		return
 	end
 
@@ -1634,12 +1991,17 @@ local function mark_project_changed(buf)
 	local active = state.active
 
 	if active and active.phase == "running" and inside(active.root, file) then
-		active.dirty = true
+		if buffer_changed_since(active.buffer_snapshots, buf, file) then
+			active.dirty = true
+			active.dirty_file = active.dirty_file or file
+		end
 	end
 
 	if state.last.root and not state.last.stale and inside(state.last.root, file) then
-		state.last.stale = true
-		emit("stale")
+		if buffer_changed_since(state.last.buffer_snapshots, buf, file) then
+			state.last.stale = true
+			emit("stale")
+		end
 	end
 end
 
@@ -1667,16 +2029,33 @@ vim.api.nvim_create_autocmd("BufWritePost", {
 			return
 		end
 
-		local active = state.active
-
-		if active and active.phase == "running" then
-			active.dirty = true
-		end
-
-		if not state.last.stale then
+		-- Active-scan config integrity is checked by filesystem signature at
+		-- commit time. Do not collapse a config change into the generic
+		-- project-buffer mutation flag, otherwise the discard reason is wrong.
+		if state.last.root and not state.last.stale then
 			state.last.stale = true
 			emit("stale")
 		end
+	end,
+})
+
+-- CMake integration is event-based so the build subsystem does not need to
+-- require the analyzer directly. User events are the supported Neovim
+-- mechanism for plugin-defined integration signals, and nvim_exec_autocmds()
+-- can attach structured data to the callback.
+vim.api.nvim_create_autocmd("User", {
+	group = freshness_group,
+	pattern = "DemirCompilationModelChanged",
+
+	callback = function(args)
+		local data = type(args.data) == "table" and args.data or {}
+		local root = data.analysis_root
+
+		if type(root) ~= "string" or root == "" then
+			return
+		end
+
+		M.invalidate_compilation_model(root, data.database, data.reason)
 	end,
 })
 

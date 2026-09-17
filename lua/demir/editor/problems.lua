@@ -1,23 +1,13 @@
 local M = {}
 
 local trouble = require("trouble")
+local project = require("demir.core.project")
 local deep_analysis = require("demir.analysis.clang_tidy")
 
 local diagnostic = vim.diagnostic
 local severity = diagnostic.severity
 
 local ns = vim.api.nvim_create_namespace("DemirProblemsCenter")
-
-local ROOT_MARKERS = {
-	git = ".git",
-
-	cmake_presets = {
-		"CMakePresets.json",
-		"CMakeUserPresets.json",
-	},
-
-	cmake = "CMakeLists.txt",
-}
 
 local REFRESH_DEBOUNCE_MS = 60
 
@@ -57,7 +47,9 @@ local state = {
 	preview_lines = nil,
 
 	deep_status = nil,
-	deep_same_project = false,
+	deep_active_same_project = false,
+	deep_committed_same_project = false,
+	deep_attempt_same_project = false,
 	deep_visible = false,
 	deep_visible_count = 0,
 
@@ -155,38 +147,6 @@ local function source_context()
 	end
 
 	return nil, nil
-end
-
-local function root_from_source(source)
-	local git = vim.fs.root(source, ROOT_MARKERS.git)
-
-	if git then
-		return canonical_path(git)
-	end
-
-	local presets = vim.fs.root(source, ROOT_MARKERS.cmake_presets)
-
-	if presets then
-		return canonical_path(presets)
-	end
-
-	local cmake = vim.fs.root(source, ROOT_MARKERS.cmake)
-
-	if cmake then
-		return canonical_path(cmake)
-	end
-
-	return canonical_path(vim.fn.getcwd())
-end
-
-local function project_root()
-	local buf = source_context()
-
-	if buf then
-		return root_from_source(buf)
-	end
-
-	return root_from_source(vim.fn.getcwd())
 end
 
 local function same_project(a, b)
@@ -367,11 +327,16 @@ local function collect_diagnostics()
 	local seen = {}
 
 	local analysis = deep_analysis.status()
-	local analysis_root = canonical_path(analysis.root)
+	local active_root = analysis.running and canonical_path(analysis.root) or ""
+	local committed_root = canonical_path(analysis.committed_root)
+	local attempt = type(analysis.last_attempt) == "table" and analysis.last_attempt or nil
+	local attempt_root = attempt and canonical_path(attempt.root) or ""
 
 	state.deep_status = analysis
-	state.deep_same_project = same_project(analysis_root, state.root)
-	state.deep_visible = state.deep_same_project and analysis.stale ~= true
+	state.deep_active_same_project = analysis.running and same_project(active_root, state.root)
+	state.deep_committed_same_project = same_project(committed_root, state.root)
+	state.deep_attempt_same_project = same_project(attempt_root, state.root)
+	state.deep_visible = state.deep_committed_same_project and analysis.stale ~= true
 	state.deep_visible_count = 0
 
 	local function add_entry(entry)
@@ -687,7 +652,7 @@ local function deep_status_label()
 	local matching_count = state.deep_visible_count or 0
 
 	if analysis.running then
-		if not state.deep_same_project then
+		if not state.deep_active_same_project then
 			return "deep busy elsewhere", "DiagnosticWarn"
 		end
 
@@ -715,32 +680,34 @@ local function deep_status_label()
 		return labels[phase] or ("deep " .. tostring(phase)), "DiagnosticWarn"
 	end
 
-	if not state.deep_same_project then
-		return "deep idle", "Comment"
-	end
+	if state.deep_committed_same_project and analysis.stale then
+		local committed_issues = analysis.committed_issues or 0
 
-	if analysis.stale and (analysis.committed_issues or 0) > 0 then
-		return string.format("deep stale %d · hidden", analysis.committed_issues), "DiagnosticWarn"
+		if committed_issues > 0 then
+			return string.format("deep stale %d · hidden", committed_issues), "DiagnosticWarn"
+		end
+
+		return "deep stale · hidden", "DiagnosticWarn"
 	end
 
 	local attempt = analysis.last_attempt
 
-	if attempt and attempt.ok == false then
+	if state.deep_attempt_same_project and attempt and attempt.ok == false then
 		local cancelled = attempt.reason == "Analysis cancelled."
 
-		return string.format(cancelled and "deep cancelled · %d kept" or "deep failed · %d kept", matching_count),
-			"DiagnosticWarn"
+		if state.deep_committed_same_project then
+			return string.format(cancelled and "deep cancelled · %d kept" or "deep failed · %d kept", matching_count),
+				"DiagnosticWarn"
+		end
+
+		return cancelled and "deep cancelled · no baseline" or "deep failed · no baseline", "DiagnosticWarn"
 	end
 
-	if attempt and attempt.ok == true then
+	if state.deep_committed_same_project then
 		if matching_count == 0 then
 			return "deep clean", "DiagnosticOk"
 		end
 
-		return string.format("deep %d", matching_count), "DiagnosticInfo"
-	end
-
-	if matching_count > 0 then
 		return string.format("deep %d", matching_count), "DiagnosticInfo"
 	end
 
@@ -905,10 +872,10 @@ local function render_list(preferred_key)
 
 		local analysis = state.deep_status or deep_analysis.status()
 
-		if state.deep_same_project and analysis.stale and (analysis.committed_issues or 0) > 0 then
+		if state.deep_committed_same_project and analysis.stale then
 			table.insert(lines, "")
 			table.insert(lines, "   Deep-analysis results are stale and hidden. Press D to rescan.")
-		elseif analysis.running and state.deep_same_project then
+		elseif analysis.running and state.deep_active_same_project then
 			table.insert(lines, "")
 			table.insert(lines, "   Deep scan is running; new findings commit atomically when complete.")
 		end
@@ -1288,7 +1255,7 @@ local function deep_action_label()
 	local analysis = state.deep_status or deep_analysis.status()
 
 	if analysis.running then
-		if state.deep_same_project then
+		if state.deep_active_same_project then
 			return "D Cancel", "DiagnosticWarn"
 		end
 
@@ -1449,7 +1416,9 @@ local function reset_runtime_state()
 	state.preview_lines = nil
 
 	state.deep_status = nil
-	state.deep_same_project = false
+	state.deep_active_same_project = false
+	state.deep_committed_same_project = false
+	state.deep_attempt_same_project = false
 	state.deep_visible = false
 	state.deep_visible_count = 0
 
@@ -1744,10 +1713,10 @@ local function setup_center_keymaps()
 
 	vim.keymap.set("n", "D", function()
 		local analysis = deep_analysis.status()
-		local analysis_same_project = same_project(analysis.root, state.root)
+		local active_same_project = analysis.running and same_project(analysis.root, state.root)
 
 		if analysis.running then
-			if analysis_same_project then
+			if active_same_project then
 				deep_analysis.cancel()
 			else
 				notify(
@@ -1959,13 +1928,16 @@ local function open_center()
 	state.open = true
 	state.closing = false
 
-	local _, source_win = source_context()
+	local source_buf, source_win = source_context()
 
 	state.main_win = valid_win(source_win) and source_win or vim.api.nvim_get_current_win()
 
 	state.main_tab = vim.api.nvim_get_current_tabpage()
 
-	state.root = project_root()
+	-- Derive the Problems Center scope from the same source context used for
+	-- focus restoration. This keeps the UI and Deep Analysis on one explicit
+	-- analysis-root policy without re-running source-context discovery.
+	state.root = project.analysis_root(source_buf or vim.fn.getcwd())
 	state.filter = "all"
 	state.query = ""
 

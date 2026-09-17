@@ -20,6 +20,23 @@ vim.opt.mousemodel = "popup_setpos"
 local CALL_HIERARCHY_METHOD = "textDocument/prepareCallHierarchy"
 local TYPE_HIERARCHY_METHOD = "textDocument/prepareTypeHierarchy"
 
+-- This root is only a UI base for "Copy Relative Path". It does not own
+-- analysis, CMake, or LSP workspace semantics. All markers have equal priority
+-- so the nearest enclosing project boundary wins instead of a distant .git
+-- repository unconditionally outranking a nested language/build project.
+local RELATIVE_PATH_ROOT_MARKERS = {
+	{
+		".git",
+		"CMakePresets.json",
+		"CMakeUserPresets.json",
+		"CMakeLists.txt",
+		"pyproject.toml",
+		"package.json",
+		"Cargo.toml",
+		"go.mod",
+	},
+}
+
 -- ─────────────────────────────────────────────────────────────
 -- Basic Helpers
 -- ─────────────────────────────────────────────────────────────
@@ -84,22 +101,14 @@ local function current_file(buf)
 	return file
 end
 
-local function project_root(file)
+local function relative_path_root(file)
 	file = normalize_path(file)
 
 	if file == "" then
 		return normalize_path(vim.fn.getcwd())
 	end
 
-	local root = vim.fs.root(file, {
-		".git",
-		"CMakeLists.txt",
-		"CMakePresets.json",
-		"pyproject.toml",
-		"package.json",
-		"Cargo.toml",
-		"go.mod",
-	})
+	local root = vim.fs.root(file, RELATIVE_PATH_ROOT_MARKERS)
 
 	return normalize_path(root or vim.fn.getcwd())
 end
@@ -257,14 +266,6 @@ end
 -- Snacks Picker Discovery
 -- ─────────────────────────────────────────────────────────────
 
-local function picker_list_win(picker)
-	if type(picker) ~= "table" or type(picker.list) ~= "table" or type(picker.list.win) ~= "table" then
-		return nil
-	end
-
-	return picker.list.win.win
-end
-
 local function active_pickers(source)
 	if type(Snacks.picker) ~= "table" or type(Snacks.picker.get) ~= "function" then
 		return {}
@@ -287,15 +288,32 @@ local function active_pickers(source)
 	return pickers
 end
 
-local function picker_for_list_window(win, source)
-	if not valid_win(win) then
+-- Snacks documents both Snacks.picker.current and Snacks.picker.get().  Use
+-- those public picker surfaces instead of reaching through picker.list.win.win.
+-- The one-picker fallback only applies while actually inside a picker buffer;
+-- it exists for compatibility with Snacks versions where `current` may be nil
+-- during a MenuPopup callback.
+local function current_picker(source)
+	if type(Snacks.picker) ~= "table" then
 		return nil
 	end
 
-	for _, picker in ipairs(active_pickers(source)) do
-		if type(picker) == "table" and picker.closed ~= true and picker_list_win(picker) == win then
-			return picker
+	local active = active_pickers(source)
+	local current = Snacks.picker.current
+
+	if type(current) == "table" then
+		for _, picker in ipairs(active) do
+			if picker == current then
+				return picker
+			end
 		end
+	end
+
+	local buf = vim.api.nvim_get_current_buf()
+	local ft = valid_buf(buf) and vim.bo[buf].filetype or ""
+
+	if ft == "snacks_picker_list" and #active == 1 then
+		return active[1]
 	end
 
 	return nil
@@ -330,7 +348,7 @@ local function picker_selected_count(picker)
 end
 
 local function run_picker_action(picker, action, title)
-	if type(picker) ~= "table" or picker.closed == true or type(picker.action) ~= "function" then
+	if type(picker) ~= "table" or type(picker.action) ~= "function" then
 		notify("The active Snacks picker is no longer available.", vim.log.levels.WARN, title or "Picker")
 		return false
 	end
@@ -511,7 +529,7 @@ function M.copy_relative_path()
 		return
 	end
 
-	local root = project_root(file)
+	local root = relative_path_root(file)
 	local relative = vim.fs.relpath(root, file)
 
 	if not relative then
@@ -528,7 +546,7 @@ end
 -- ─────────────────────────────────────────────────────────────
 
 local function current_explorer_picker()
-	return picker_for_list_window(vim.api.nvim_get_current_win(), "explorer")
+	return current_picker("explorer")
 end
 
 local function require_explorer_picker()
@@ -670,7 +688,7 @@ function M.explorer_terminal_here()
 		return
 	end
 
-	local is_dir = item.dir == true or vim.fn.isdirectory(file) == 1
+	local is_dir = vim.fn.isdirectory(file) == 1
 	local dir = is_dir and file or vim.fs.dirname(file)
 
 	if type(dir) ~= "string" or dir == "" or vim.fn.isdirectory(dir) ~= 1 then
@@ -694,7 +712,7 @@ end
 -- ─────────────────────────────────────────────────────────────
 
 local function current_generic_picker()
-	return picker_for_list_window(vim.api.nvim_get_current_win(), nil)
+	return current_picker(nil)
 end
 
 local function require_generic_picker()
@@ -806,7 +824,7 @@ local function detect_context()
 		}
 	end
 
-	local explorer = picker_for_list_window(win, "explorer")
+	local explorer = current_picker("explorer")
 
 	if explorer then
 		return {
@@ -819,7 +837,7 @@ local function detect_context()
 		}
 	end
 
-	local picker = picker_for_list_window(win, nil)
+	local picker = current_picker(nil)
 
 	if picker then
 		return {
@@ -1196,7 +1214,7 @@ end
 local function explorer_normal_menu(ctx)
 	local item = ctx.item
 	local has_item = type(item) == "table" and type(item.file) == "string" and item.file ~= ""
-	local is_directory = has_item and (item.dir == true or vim.fn.isdirectory(item.file) == 1)
+	local is_directory = has_item and vim.fn.isdirectory(item.file) == 1
 	local is_file = has_item and not is_directory
 	local has_selection = ctx.selected_count > 0
 	local selection_suffix = has_selection and string.format(" (%d Selected)", ctx.selected_count) or ""
@@ -1400,7 +1418,9 @@ end
 -- re-enable or reconfigure the default right-click entries after our router.
 pcall(vim.cmd, "silent! aunmenu PopUp")
 pcall(vim.cmd, "silent! tlunmenu PopUp")
-pcall(vim.api.nvim_del_augroup_by_name, "nvim.popupmenu")
+-- Neovim documents `autocmd! nvim.popupmenu` as the supported way to disable
+-- the built-in context-menu updater.  Do not delete Neovim's augroup object.
+pcall(vim.cmd, "silent! autocmd! nvim.popupmenu")
 
 local group = vim.api.nvim_create_augroup("DemirContextMenu", {
 	clear = true,
